@@ -4,3 +4,9 @@ dist
 .env.*
 !.env.example
 *.local
+
+# tsc -b (project references / "composite": true) build artifacts --
+# harmless if committed, but there's no reason to track them
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
