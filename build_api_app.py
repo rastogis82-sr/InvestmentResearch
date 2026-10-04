@@ -12,7 +12,7 @@ Produces: investment_research_api.py (validated with ast.parse)
 import ast
 import re
 
-LOCAL_MODULES = ["guardrails", "schemas", "tools_mock", "corpus", "node_logic", "mock_llm", "local_retriever", "real_market_data", "fcs_market_data", "merged_market_data"]
+LOCAL_MODULES = ["guardrails", "schemas", "tools_mock", "corpus", "node_logic", "mock_llm", "local_retriever", "real_market_data", "alpha_vantage_market_data", "merged_market_data"]
 
 
 def load_and_clean(path: str) -> str:
@@ -112,14 +112,17 @@ Configuration (environment variables, all optional with sane defaults):
                         https://twelvedata.com/pricing. Without it, its
                         calls fail cleanly (missing_twelvedata_api_key)
                         rather than fabricating data.
-    FCS_API_KEY         Optional, independent of TWELVEDATA_API_KEY.
+    ALPHA_VANTAGE_API_KEY
+                        Optional, independent of TWELVEDATA_API_KEY.
                         Fills in company profile and real
                         financial-statement data (revenue, margins, YoY
                         growth) that Twelve Data's free plan can't
                         provide at all — see merged_market_data.py. Free
-                        signup at https://fcsapi.com/pricing. Set either,
-                        both, or neither of these two keys; ABC/XYZ/DEF
-                        are unaffected either way.
+                        signup at
+                        https://www.alphavantage.co/support/#api-key
+                        (free tier: 25 requests/day). Set either, both,
+                        or neither of these two keys; ABC/XYZ/DEF are
+                        unaffected either way.
 
 All of the above are read from the process environment — never
 hardcoded in this file. Locally (or in Vocareum), copy `.env.example` to
@@ -199,15 +202,15 @@ logger = get_logger("investment_research_assistant")
 {load_and_clean("real_market_data.py")}
 
 # =============================================================================
-# Real-company market data, provider 2 (FCS API) — identical to
-# fcs_market_data.py. Closes the exact gap provider 1's free plan leaves:
-# company profile and real financial-statement data (revenue, margins,
-# YoY growth). Set FCS_API_KEY to enable it (free signup at
-# https://fcsapi.com/pricing); without it, its calls fail cleanly the
-# same way. Independent of TWELVEDATA_API_KEY -- set either, both, or
-# neither.
+# Real-company market data, provider 2 (Alpha Vantage) — identical to
+# alpha_vantage_market_data.py. Closes the exact gap provider 1's free
+# plan leaves: company profile and real financial-statement data
+# (revenue, margins, YoY growth). Set ALPHA_VANTAGE_API_KEY to enable it
+# (free signup at https://www.alphavantage.co/support/#api-key, free
+# tier: 25 requests/day); without it, its calls fail cleanly the same
+# way. Independent of TWELVEDATA_API_KEY -- set either, both, or neither.
 # =============================================================================
-{load_and_clean("fcs_market_data.py")}
+{load_and_clean("alpha_vantage_market_data.py")}
 
 # =============================================================================
 # Combines both providers above, field by field — identical to

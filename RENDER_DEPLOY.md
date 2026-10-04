@@ -64,8 +64,8 @@ instead.
 
 `render.yaml` already declares the non-secret config inline (`MOCK_LLM`,
 `LLM_PROVIDER`, `IRA_SCORE_THRESHOLD`, `TWELVEDATA_CACHE_TTL_SECONDS`,
-`FCS_CACHE_TTL_SECONDS`). In the **Environment** tab, set the secrets
-Render prompts for:
+`ALPHA_VANTAGE_CACHE_TTL_SECONDS`). In the **Environment** tab, set the
+secrets Render prompts for:
 
 | Key | Required? | Value |
 |---|---|---|
@@ -73,13 +73,30 @@ Render prompts for:
 | `ANTHROPIC_API_KEY` | Only if `LLM_PROVIDER` starts with `anthropic:` | Your Anthropic key |
 | `OPENAI_BASE_URL` | Optional | A Vocareum-style proxy URL, if you're using one instead of a personal OpenAI key |
 | `TWELVEDATA_API_KEY` | Optional | Enables real-company (AAPL/MSFT/GOOGL/AMZN/TSLA/NVDA) live data — free signup at twelvedata.com/pricing. Reliable for live price; its free plan can't serve company profile or any real financial-statement data (see `real_market_data.py`). |
-| `FCS_API_KEY` | Optional, but recommended alongside `TWELVEDATA_API_KEY` | Fills in exactly the profile/financials gap Twelve Data's free plan leaves — free signup at fcsapi.com/pricing. See `merged_market_data.py`. Without it, real-company profile/financials questions fall back to whatever Twelve Data alone can provide (often `plan_restricted` on a free key). |
+| `ALPHA_VANTAGE_API_KEY` | Optional, but recommended alongside `TWELVEDATA_API_KEY` | Fills in exactly the profile/financials gap Twelve Data's free plan leaves — free signup at alphavantage.co/support/#api-key. See `merged_market_data.py`. Without it, real-company profile/financials questions fall back to whatever Twelve Data alone can provide (often `plan_restricted` on a free key). Free tier is capped at 25 requests/DAY, not just per-minute — expect `rate_limited` results after a handful of real-company lookups in one demo session. |
 
 Set either, both, or neither of the two market-data keys independently —
 `merged_market_data.py` degrades gracefully: both set gives the richest
 merged data, one set uses just that provider, neither set reports a clean
 tool failure for real-company questions (ABC/XYZ/DEF are unaffected
 either way, they never call either API).
+
+**If a real-company tool call comes back with `api_error_401:**apikey**
+parameter is incorrect or not specified` (Twelve Data) or
+`invalid_api_key:...` (Alpha Vantage) on your LIVE Render service**, that
+is a deployment/configuration problem, not a code bug: it means the
+corresponding env var is blank, misspelled, or holds a stray extra
+character (quotes, leading/trailing whitespace) on the actual Render
+service — not in this repo, which never hardcodes keys. Fix it in the
+**Environment** tab: open the service → Environment → check
+`TWELVEDATA_API_KEY` / `ALPHA_VANTAGE_API_KEY` are both present, spelled
+exactly as above, and paste the raw key value with no surrounding quotes
+— then **Save Changes**, which triggers an automatic redeploy. A key that
+works when you test it locally (e.g. via the notebook) but 401s only on
+Render almost always means the value never actually got saved to that
+service's Environment tab (easy to miss if the key was set on one
+service — e.g. the Gradio UI — instead of the API service, since each
+Render service has its own independent Environment tab).
 
 ## Step 4 — Deploy and verify
 

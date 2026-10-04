@@ -40,14 +40,17 @@ Configuration (environment variables, all optional with sane defaults):
                         https://twelvedata.com/pricing. Without it, its
                         calls fail cleanly (missing_twelvedata_api_key)
                         rather than fabricating data.
-    FCS_API_KEY         Optional, independent of TWELVEDATA_API_KEY.
+    ALPHA_VANTAGE_API_KEY
+                        Optional, independent of TWELVEDATA_API_KEY.
                         Fills in company profile and real
                         financial-statement data (revenue, margins, YoY
                         growth) that Twelve Data's free plan can't
                         provide at all — see merged_market_data.py. Free
-                        signup at https://fcsapi.com/pricing. Set either,
-                        both, or neither of these two keys; ABC/XYZ/DEF
-                        are unaffected either way.
+                        signup at
+                        https://www.alphavantage.co/support/#api-key
+                        (free tier: 25 requests/day). Set either, both,
+                        or neither of these two keys; ABC/XYZ/DEF are
+                        unaffected either way.
 
 All of the above are read from the process environment — never
 hardcoded in this file. Locally (or in Vocareum), copy `.env.example` to
@@ -623,70 +626,89 @@ def get_real_company_financials(ticker: str) -> dict:
 
 
 # =============================================================================
-# Real-company market data, provider 2 (FCS API) — identical to
-# fcs_market_data.py. Closes the exact gap provider 1's free plan leaves:
-# company profile and real financial-statement data (revenue, margins,
-# YoY growth). Set FCS_API_KEY to enable it (free signup at
-# https://fcsapi.com/pricing); without it, its calls fail cleanly the
-# same way. Independent of TWELVEDATA_API_KEY -- set either, both, or
-# neither.
+# Real-company market data, provider 2 (Alpha Vantage) — identical to
+# alpha_vantage_market_data.py. Closes the exact gap provider 1's free
+# plan leaves: company profile and real financial-statement data
+# (revenue, margins, YoY growth). Set ALPHA_VANTAGE_API_KEY to enable it
+# (free signup at https://www.alphavantage.co/support/#api-key, free
+# tier: 25 requests/day); without it, its calls fail cleanly the same
+# way. Independent of TWELVEDATA_API_KEY -- set either, both, or neither.
 # =============================================================================
 """
-fcs_market_data.py
--------------------
+alpha_vantage_market_data.py
+------------------------------
 A second live-data source for the same curated real-company universe
 `real_market_data.py` already covers (AAPL/MSFT/GOOGL/AMZN/TSLA/NVDA),
-backed by FCS API's Stock Market API (https://fcsapi.com/document/stock-api).
+backed by Alpha Vantage (https://www.alphavantage.co/documentation/).
 
-This exists to close a real gap, not to replace Twelve Data: on Twelve
-Data's free ("Basic") plan, `/profile` is plan-restricted (so
-`get_company_profile` legitimately fails) and there is no free
-fundamentals endpoint at all (so `get_company_financials` never returns
-actual revenue/margin figures, even when it "succeeds" — see
-`real_market_data.py`'s module docstring). FCS API's free plan includes
-`/stock/profile` (sector, industry, HQ, description, employee count,
-market cap, CEO, website) and enough of `/stock/statistics` and
-`/stock/income_statements` to recover real margins and a genuine
-year-over-year revenue-growth figure. `merged_market_data.py` is what
-actually combines this module's output with `real_market_data.py`'s —
-this module, like `real_market_data.py`, only ever talks to ONE provider
-and follows the exact same never-fabricate contract on its own.
+This REPLACES fcs_market_data.py as the secondary provider. FCS API's
+documentation implied its `/stock/profile` and `/stock/statistics` /
+`/stock/income_statements` endpoints were free-plan accessible, but a live
+test against the user's real FCS API key showed the opposite: FCS API's
+free plan rejects EVERY stock endpoint outright ("A Free API Key user
+cannot be used with stock/index endpoint. Please upgrade your plan.") —
+not a documentation gap on our side, a documentation-vs-reality mismatch
+on FCS API's own site. Alpha Vantage's free tier, by contrast, has no
+endpoint-level gating: any function works on a free key, the constraint
+is purely a request-count ceiling (25 requests/day, 5 requests/minute —
+see https://www.alphavantage.co/premium/).
 
-Requires an FCS API key (free signup, no credit card):
-https://fcsapi.com/pricing — set via the FCS_API_KEY environment
-variable. If it's missing, every call below returns a clean
-{"ok": False, "error": "missing_fcs_api_key"} result rather than raising,
-exactly like real_market_data.py does for a missing Twelve Data key.
+Why this module exists at all (same gap as fcs_market_data.py was closing):
+Twelve Data's free plan can't provide `get_company_profile` (`/profile`
+is plan-restricted) or real `get_company_financials` figures (no free
+fundamentals endpoint exists at all — see real_market_data.py's module
+docstring). Alpha Vantage's `OVERVIEW` function covers both gaps in a
+SINGLE call: it returns company profile fields (sector, industry,
+description, address, website) AND trailing-twelve-month financial
+fields (RevenueTTM, GrossProfitTTM, ProfitMargin, OperatingMarginTTM,
+QuarterlyRevenueGrowthYOY, EBITDA, MarketCapitalization, PERatio) in one
+response. That one-call-covers-both design is deliberate here: given
+Alpha Vantage's tight 25-requests/day free ceiling, calling `OVERVIEW`
+once per ticker and reusing it for both `get_alpha_vantage_company_profile`
+and `get_alpha_vantage_company_financials` (via the module-level cache
+below) costs half what two separate endpoints would.
+
+Requires an Alpha Vantage API key (free signup, no credit card):
+https://www.alphavantage.co/support/#api-key — set via the
+ALPHA_VANTAGE_API_KEY environment variable. If it's missing, every call
+below returns a clean {"ok": False, "error": "missing_alpha_vantage_api_key"}
+result rather than raising, exactly like real_market_data.py does for a
+missing Twelve Data key.
 
 Honest limitations — read before being surprised by an unfamiliar error:
-  - FCS API's free plan is capped at 500 requests/month AND 3 requests
-    per minute (https://fcsapi.com/pricing) — noticeably tighter than
-    Twelve Data's free per-minute allowance. `get_fcs_company_financials`
-    alone costs 2 of those 3 (one for `/stock/statistics`, one for
-    `/stock/income_statements`), so two real-company financials lookups
-    back-to-back inside the same 60-second window can legitimately hit
-    the rate limit. That comes back as a normal `{"ok": False, "error":
-    "rate_limited:..."}`` result, same as any other API-level failure —
-    never a crash, never fabricated data.
-  - Response shapes below (the `response`/`profile`/`active` envelope,
-    `/stock/statistics` and `/stock/income_statements`'s field names) are
-    taken from FCS API's own published documentation examples, the same
-    "verified against docs, not against the live API" approach
-    `real_market_data.py` already uses — this sandbox has no outbound
+  - Free tier is 25 requests/DAY (not per-minute) and 5 requests/minute
+    (https://www.alphavantage.co/premium/). That daily cap is tight
+    enough that `_CACHE_TTL_SECONDS` defaults higher here than the other
+    two market-data modules' 30-second default — see below — but a cache
+    TTL only helps within one process's lifetime; it cannot stretch a
+    hard daily quota across a classroom's worth of demo runs. Budget
+    accordingly when demoing live.
+  - Alpha Vantage signals rate-limiting and plan/key problems INSIDE a
+    200 OK response body, not via HTTP status codes: a `"Note"` key means
+    the per-minute/per-day limit was hit, an `"Information"` key means a
+    bad/demo API key or an unrecognized function, and an `"Error Message"`
+    key means a bad symbol or malformed parameter. `_alpha_vantage_get`
+    below checks for all three before trusting the payload as real data.
+  - `OVERVIEW` does not include employee count, CEO name, or founding
+    year (the fields FCS API's `/stock/profile` used to supply) — Alpha
+    Vantage simply doesn't have a field for these. `merged_market_data.py`
+    is built to never fabricate a field that genuinely isn't available
+    from either provider, so those three fields are just honestly absent
+    now rather than back-filled with a guess.
+  - `OVERVIEW`'s numeric fields come back as JSON STRINGS (e.g.
+    `"ProfitMargin": "0.2431"`, a fraction, not a percentage — multiply by
+    100 before treating it as one), and a field Alpha Vantage doesn't have
+    data for is the literal string `"None"`, not JSON null. `_to_float`
+    below handles both.
+  - Response field names below are taken from Alpha Vantage's own
+    published documentation and the GAAP fundamentals field reference
+    (https://www.alphavantage.co/documentation/,
+    https://documentation.alphavantage.co/FundamentalDataDocs/gaap_documentation.html),
+    the same "verified against docs, not against the live API" approach
+    the other two market-data modules use — this sandbox has no outbound
     network access to third-party APIs to test against the live service
     either. Smoke-test with a real key in Colab before trusting this in
     front of a grader (see the `__main__` block at the bottom).
-  - The curated ticker set is assumed to trade on NASDAQ (true for all
-    six: AAPL, MSFT, GOOGL, AMZN, TSLA, NVDA), since FCS API's `symbol`
-    parameter is exchange-qualified (`NASDAQ:AAPL`, per its docs). Adding
-    a ticker on a different exchange to `real_market_data.REAL_COMPANIES`
-    would need its exchange added to `_EXCHANGE_OVERRIDES` below, or this
-    module will send a (likely wrong) `NASDAQ:` prefix for it.
-  - `/stock/income_statements` reports raw dollar figures, not millions —
-    `get_fcs_company_financials` divides by 1e6 to match this project's
-    existing `*_usd_m` convention (see `tools_mock.py`'s `_COMPANY_DB`).
-    Year-over-year revenue growth is computed here (latest fiscal period
-    vs. the prior one in the same response), not returned directly by FCS.
 """
 
 import os
@@ -695,20 +717,19 @@ from typing import Optional
 
 import requests
 
-FCS_BASE_URL = "https://api-v4.fcsapi.com"
+ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query"
 _SESSION = requests.Session()
-_CACHE_TTL_SECONDS = float(os.environ.get("FCS_CACHE_TTL_SECONDS", "30"))
+# Higher default than real_market_data.py / fcs_market_data.py's 30s: Alpha
+# Vantage's quota is per-DAY (25/day), not just per-minute, so it's worth
+# holding a cached answer longer within one process's lifetime.
+_CACHE_TTL_SECONDS = float(os.environ.get("ALPHA_VANTAGE_CACHE_TTL_SECONDS", "120"))
 _CACHE: dict = {}
-
-# All six curated real companies (real_market_data.REAL_COMPANIES) trade on
-# NASDAQ — see the module docstring. Override here per-ticker if a future
-# addition trades elsewhere; anything not listed defaults to NASDAQ.
-_EXCHANGE_OVERRIDES: dict = {}
 
 
 def clear_cache() -> None:
-    """Same purpose as real_market_data.clear_cache() — mainly for tests
-    and for debugging a live data issue without restarting the process."""
+    """Same purpose as real_market_data.clear_cache() / fcs_market_data's
+    equivalent — mainly for tests and for debugging a live data issue
+    without restarting the process."""
     _CACHE.clear()
 
 
@@ -729,47 +750,58 @@ def _cache_set(key, value: dict) -> None:
 
 
 def _get_api_key() -> str:
-    return os.environ.get("FCS_API_KEY", "").strip()
+    return os.environ.get("ALPHA_VANTAGE_API_KEY", "").strip()
 
 
-def _fcs_symbol(ticker: str) -> str:
-    exchange = _EXCHANGE_OVERRIDES.get(ticker.upper(), "NASDAQ")
-    return f"{exchange}:{ticker.upper()}"
+def _clean_str(value) -> Optional[str]:
+    """Alpha Vantage uses the literal string "None" for a text field it has
+    no data for too (not just numeric fields) -- same normalization as
+    _to_float, just returning the original string instead of a float."""
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in ("none", ""):
+        return None
+    return value
 
 
-def _unwrap(payload) -> Optional[dict]:
-    """FCS API wraps a single-symbol result in a one-item list for
-    /stock/latest and /stock/profile, but returns /stock/statistics and
-    /stock/income_statements as a direct object (per FCS API's own
-    documented examples) — this normalizes both shapes to "the one record
-    we actually asked for", or None if the envelope is empty/unexpected."""
-    response = payload.get("response")
-    if isinstance(response, list):
-        return response[0] if response else None
-    if isinstance(response, dict):
-        return response
-    return None
+def _to_float(value) -> Optional[float]:
+    """Alpha Vantage returns numeric fields as JSON strings, and uses the
+    literal string "None" (not JSON null) for a field it has no data for.
+    Handles both, same contract as the other two market-data modules'
+    _to_float helpers."""
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in ("none", ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
-def _fcsapi_get(path: str, params: dict, tool_name: str, cache_key_suffix: str = "") -> dict:
+def _alpha_vantage_get(params: dict, tool_name: str, cache_key_suffix: str = "") -> dict:
     """Shared request helper, same never-raise contract as
-    real_market_data._twelvedata_get: whatever goes wrong (missing key,
-    network error, bad symbol, rate limit) comes back as
-    {"ok": False, "error": ..., "tool": ...}, never an exception."""
+    real_market_data._twelvedata_get / fcs_market_data._fcsapi_get:
+    whatever goes wrong (missing key, network error, bad symbol, rate
+    limit) comes back as {"ok": False, "error": ..., "tool": ...}, never
+    an exception. Returns {"ok": True, "tool": ..., "data": <raw payload>}
+    on success -- callers map the raw Alpha Vantage field names to this
+    project's own field names."""
     symbol = params.get("symbol", "")
-    cache_key = (path, symbol, cache_key_suffix)
+    function = params.get("function", "")
+    cache_key = (function, symbol, cache_key_suffix)
     cached = _cache_get(cache_key)
     if cached is not None:
         return {**cached, "tool": tool_name}
 
     api_key = _get_api_key()
     if not api_key:
-        return {"ok": False, "error": "missing_fcs_api_key", "tool": tool_name}
+        return {"ok": False, "error": "missing_alpha_vantage_api_key", "tool": tool_name}
 
     try:
         resp = _SESSION.get(
-            f"{FCS_BASE_URL}{path}",
-            params={**params, "access_key": api_key},
+            ALPHA_VANTAGE_BASE_URL,
+            params={**params, "apikey": api_key},
             timeout=10,
         )
     except requests.exceptions.RequestException as e:
@@ -778,172 +810,177 @@ def _fcsapi_get(path: str, params: dict, tool_name: str, cache_key_suffix: str =
         # same reasoning).
         return {"ok": False, "error": f"network_error:{type(e).__name__}", "tool": tool_name}
 
+    if resp.status_code != 200:
+        return {"ok": False, "error": f"api_error_{resp.status_code}:http_status", "tool": tool_name}
+
     try:
         payload = resp.json()
     except ValueError:
         return {"ok": False, "error": f"non_json_response:status_{resp.status_code}", "tool": tool_name}
 
-    if not isinstance(payload, dict) or payload.get("status") is not True:
-        code = payload.get("code") if isinstance(payload, dict) else None
-        message = str(payload.get("msg", "unknown_error")) if isinstance(payload, dict) else "unknown_error"
+    if not isinstance(payload, dict):
+        result = {"ok": False, "error": "unexpected_response_shape", "tool": tool_name}
+        return result
+
+    # Alpha Vantage signals problems INSIDE a 200 OK body -- see the module
+    # docstring's Honest limitations.
+    if "Note" in payload:
+        result = {"ok": False, "error": f"rate_limited:{payload['Note']}", "tool": tool_name}
+        # Deterministic for the rest of this quota window -- don't keep
+        # re-asking an already-rate-limited question and burning more of
+        # the 25-requests/day free quota.
+        _cache_set(cache_key, result)
+        return result
+    if "Information" in payload:
+        message = str(payload["Information"])
         message_l = message.lower()
-        if code == 429 or "rate limit" in message_l or "too many" in message_l:
-            result = {"ok": False, "error": f"rate_limited:{message}", "tool": tool_name}
-        elif code in (401, 403) or "plan" in message_l or "upgrade" in message_l or "subscription" in message_l:
-            result = {"ok": False, "error": f"plan_restricted:{message}", "tool": tool_name}
+        if "api key" in message_l or "apikey" in message_l or "demo" in message_l:
+            result = {"ok": False, "error": f"invalid_api_key:{message}", "tool": tool_name}
         else:
-            result = {"ok": False, "error": f"api_error_{code}:{message}", "tool": tool_name}
-        # Deterministic-for-the-TTL-window failures are cached, same
-        # reasoning as real_market_data.py (don't burn more of FCS's
-        # especially tight 3-requests-per-minute free quota re-asking an
-        # already-answered question).
+            result = {"ok": False, "error": f"api_error:{message}", "tool": tool_name}
+        _cache_set(cache_key, result)
+        return result
+    if "Error Message" in payload:
+        result = {"ok": False, "error": f"api_error:{payload['Error Message']}", "tool": tool_name}
         _cache_set(cache_key, result)
         return result
 
-    record = _unwrap(payload)
-    if record is None:
+    if not payload:
+        # Alpha Vantage's OVERVIEW returns an empty {} for an unrecognized
+        # symbol, with none of the three error keys above set.
         result = {"ok": False, "error": "empty_response", "tool": tool_name}
         _cache_set(cache_key, result)
         return result
 
-    result = {"ok": True, "tool": tool_name, "data": record}
+    result = {"ok": True, "tool": tool_name, "data": payload}
     _cache_set(cache_key, result)
     return result
 
 
-def _to_float(value) -> Optional[float]:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+def _get_overview(ticker: str, tool_name: str) -> dict:
+    """OVERVIEW is cached per-ticker and shared by BOTH
+    get_alpha_vantage_company_profile and get_alpha_vantage_company_financials
+    below -- see the module docstring for why one call covering both is
+    deliberate given the 25-requests/day free ceiling. `tool_name` is only
+    used to label the result if this particular call fails; the cache key
+    itself is keyed on (function, symbol) so profile and financials share
+    the same cached entry regardless of which one asked first."""
+    return _alpha_vantage_get({"function": "OVERVIEW", "symbol": ticker.upper()}, tool_name)
 
 
-def get_fcs_stock_price(ticker: str) -> dict:
-    """Live price snapshot via FCS API's `/stock/latest`. Used by
-    merged_market_data.py only as a FALLBACK when Twelve Data's own
-    `/quote` call fails — Twelve Data's free plan already covers price
-    reliably, so this conserves FCS's tighter free-tier quota for
-    profile/financials, where Twelve Data's free plan can't help at all."""
-    result = _fcsapi_get("/stock/latest", {"symbol": _fcs_symbol(ticker)}, "get_stock_price")
+def get_alpha_vantage_stock_price(ticker: str) -> dict:
+    """Live price snapshot via Alpha Vantage's `GLOBAL_QUOTE` function.
+    Used by merged_market_data.py only as a FALLBACK when Twelve Data's
+    own `/quote` call fails -- Twelve Data's free plan already covers
+    price reliably, so this conserves Alpha Vantage's especially tight
+    daily quota for profile/financials, where Twelve Data's free plan
+    can't help at all."""
+    result = _alpha_vantage_get({"function": "GLOBAL_QUOTE", "symbol": ticker.upper()}, "get_stock_price")
     if not result["ok"]:
         return result
-    active = (result["data"] or {}).get("active") or {}
+    quote = (result["data"] or {}).get("Global Quote") or {}
+    if not quote:
+        return {"ok": False, "error": "empty_response", "tool": "get_stock_price"}
+    change_pct_raw = quote.get("10. change percent", "")
+    change_pct = _to_float(str(change_pct_raw).rstrip("%")) if change_pct_raw else None
     return {
         "ok": True,
         "tool": "get_stock_price",
         "data": {
-            "last_price_usd": _to_float(active.get("c")),
-            "day_change_pct": _to_float(active.get("chp")),
-            "volume": _to_float(active.get("v")),
-            "as_of": active.get("tm"),
-            "source": "fcsapi.com (live)",
+            "last_price_usd": _to_float(quote.get("05. price")),
+            "day_change_pct": change_pct,
+            "volume": _to_float(quote.get("06. volume")),
+            "as_of": quote.get("07. latest trading day"),
+            "source": "alphavantage.co (live)",
         },
     }
 
 
-def get_fcs_company_profile(ticker: str) -> dict:
-    """Company profile via FCS API's `/stock/profile` — sector, industry,
-    HQ, description, employee count, founding year, CEO, website, and
-    market cap. All available on FCS API's free plan (unlike Twelve
-    Data's equivalent, which needs a paid plan) — this is the main reason
-    this module exists."""
-    result = _fcsapi_get("/stock/profile", {"symbol": _fcs_symbol(ticker)}, "get_company_profile")
+def get_alpha_vantage_company_profile(ticker: str) -> dict:
+    """Company profile via Alpha Vantage's `OVERVIEW` function -- sector,
+    industry, HQ, description, website, and market cap. All available on
+    Alpha Vantage's free plan (unlike Twelve Data's equivalent, which
+    needs a paid plan). Note: OVERVIEW has no employee count, CEO name, or
+    founding year fields at all -- those simply aren't included here (see
+    the module docstring's Honest limitations), not silently dropped."""
+    result = _get_overview(ticker, "get_company_profile")
     if not result["ok"]:
         return result
-    p = (result["data"] or {}).get("profile") or {}
-    market_cap = _to_float(p.get("market_cap"))
-    founded = p.get("founded")
-    hq = ", ".join(x for x in [p.get("headquarters"), p.get("region")] if x)
+    o = result["data"] or {}
+    market_cap = _to_float(o.get("MarketCapitalization"))
+    address = _clean_str(o.get("Address"))
+    country = _clean_str(o.get("Country"))
+    hq = ", ".join(x for x in [address, country] if x)
     return {
         "ok": True,
         "tool": "get_company_profile",
         "data": {
-            "sector": p.get("sector"),
-            "industry": p.get("industry"),
+            "name": _clean_str(o.get("Name")),
+            "sector": _clean_str(o.get("Sector")),
+            "industry": _clean_str(o.get("Industry")),
             "hq": hq or None,
-            "description": p.get("description"),
-            "employees": p.get("total_employees"),
-            # Kept as a string, not a number -- a founding year like 1976
-            # must never pass through the generic numeric formatter, which
-            # would render it as "1,976".
-            "founded": str(founded) if founded else None,
-            "ceo": p.get("ceo"),
-            "website": p.get("website"),
+            "description": _clean_str(o.get("Description")),
+            "website": _clean_str(o.get("OfficialSite")),
             "market_cap_usd_b": market_cap / 1e9 if market_cap is not None else None,
-            "source": "fcsapi.com (live)",
+            "source": "alphavantage.co (live)",
         },
     }
 
 
-def get_fcs_company_financials(ticker: str) -> dict:
-    """Real margins and a real year-over-year revenue-growth figure, via
-    FCS API's `/stock/statistics` (margins, P/E, market cap) and
-    `/stock/income_statements` (revenue, net income, EPS, keyed by
-    fiscal-period date) — the two endpoints Twelve Data's free plan has no
-    equivalent for at all. Costs 2 of FCS API's 3-requests-per-minute free
-    quota; see the module docstring's Honest limitations.
+def get_alpha_vantage_company_financials(ticker: str) -> dict:
+    """Real margins, revenue, and a real year-over-year revenue-growth
+    figure, all from the SAME `OVERVIEW` call `get_alpha_vantage_company_profile`
+    already makes (and shares via the module-level cache) -- the one
+    endpoint Twelve Data's free plan has no equivalent for at all.
+    `net_income_usd_m` is calculated (RevenueTTM x ProfitMargin), not a
+    field Alpha Vantage returns directly -- labeled as such in `note` so
+    the transparency panel never implies it's a raw reported figure."""
+    result = _get_overview(ticker, "get_company_financials")
+    if not result["ok"]:
+        return result
+    o = result["data"] or {}
 
-    Partial success is still success: if one endpoint fails (e.g. a
-    free-plan restriction on `/stock/income_statements` specifically) but
-    the other succeeds, this returns ok=True with whatever fields the
-    successful call actually provided — never fabricating the other
-    endpoint's fields, just honestly omitting them. Only returns ok=False
-    if BOTH endpoints fail."""
-    symbol = _fcs_symbol(ticker)
-    stats_result = _fcsapi_get("/stock/statistics", {"symbol": symbol}, "get_company_financials")
-    income_result = _fcsapi_get(
-        "/stock/income_statements", {"symbol": symbol}, "get_company_financials", cache_key_suffix="income"
-    )
+    revenue_ttm = _to_float(o.get("RevenueTTM"))
+    profit_margin = _to_float(o.get("ProfitMargin"))
+    gross_profit_ttm = _to_float(o.get("GrossProfitTTM"))
+    operating_margin = _to_float(o.get("OperatingMarginTTM"))
+    revenue_growth = _to_float(o.get("QuarterlyRevenueGrowthYOY"))
+    market_cap = _to_float(o.get("MarketCapitalization"))
+    pe_ratio = _to_float(o.get("PERatio"))
+    ebitda = _to_float(o.get("EBITDA"))
 
     data: dict = {}
-    errors = []
-
-    if stats_result["ok"]:
-        s = stats_result["data"] or {}
-        data["net_margin_pct"] = _to_float(s.get("net_margin"))
-        data["gross_margin_pct"] = _to_float(s.get("gross_margin"))
-        data["operating_margin_pct"] = _to_float(s.get("operating_margin"))
-        data["pe_ratio"] = _to_float(s.get("price_earnings"))
-        market_cap = _to_float(s.get("market_cap_basic"))
-        if market_cap is not None:
-            data["market_cap_usd_b"] = market_cap / 1e9
-    else:
-        errors.append(f"statistics:{stats_result.get('error')}")
-
-    if income_result["ok"]:
-        periods = income_result["data"] or {}
-        # Keys are "YYYY-MM-DD" fiscal-period-end dates; sort descending so
-        # [0] is the latest period and [1] (if present) is the prior one,
-        # used to compute YoY growth below.
-        sorted_dates = sorted((d for d in periods if isinstance(periods.get(d), dict)), reverse=True)
-        if sorted_dates:
-            latest = periods[sorted_dates[0]]
-            latest_revenue = _to_float(latest.get("total_revenue"))
-            latest_net_income = _to_float(latest.get("net_income"))
-            if latest_revenue is not None:
-                data["revenue_usd_m"] = latest_revenue / 1e6
-            if latest_net_income is not None:
-                data["net_income_usd_m"] = latest_net_income / 1e6
-            data["fiscal_year"] = sorted_dates[0]
-            if len(sorted_dates) > 1:
-                prior_revenue = _to_float(periods[sorted_dates[1]].get("total_revenue"))
-                if latest_revenue is not None and prior_revenue:
-                    data["revenue_growth_yoy_pct"] = (latest_revenue - prior_revenue) / prior_revenue * 100
-    else:
-        errors.append(f"income_statements:{income_result.get('error')}")
+    if revenue_ttm is not None:
+        data["revenue_usd_m"] = revenue_ttm / 1e6
+    if profit_margin is not None:
+        data["net_margin_pct"] = profit_margin * 100
+    if revenue_ttm is not None and gross_profit_ttm is not None:
+        data["gross_margin_pct"] = gross_profit_ttm / revenue_ttm * 100 if revenue_ttm else None
+    if operating_margin is not None:
+        data["operating_margin_pct"] = operating_margin * 100
+    if revenue_growth is not None:
+        data["revenue_growth_yoy_pct"] = revenue_growth * 100
+    if pe_ratio is not None:
+        data["pe_ratio"] = pe_ratio
+    if market_cap is not None:
+        data["market_cap_usd_b"] = market_cap / 1e9
+    if ebitda is not None:
+        data["ebitda_usd_m"] = ebitda / 1e6
+    if revenue_ttm is not None and profit_margin is not None:
+        data["net_income_usd_m"] = revenue_ttm * profit_margin / 1e6
+    fiscal_quarter = _clean_str(o.get("LatestQuarter"))
+    if fiscal_quarter:
+        data["fiscal_year"] = fiscal_quarter
 
     if not data:
-        return {
-            "ok": False,
-            "tool": "get_company_financials",
-            "error": "; ".join(errors) or "unknown_error",
-        }
+        return {"ok": False, "tool": "get_company_financials", "error": "empty_response"}
 
-    if errors:
-        data["note"] = f"Partial data -- one FCS API endpoint failed ({'; '.join(errors)})."
-    data["source"] = "fcsapi.com (live)"
+    notes = []
+    if "net_income_usd_m" in data:
+        notes.append("net_income_usd_m is calculated (RevenueTTM x ProfitMargin), not a figure Alpha Vantage reports directly.")
+    if notes:
+        data["note"] = " ".join(notes)
+    data["source"] = "alphavantage.co (live)"
     return {"ok": True, "tool": "get_company_financials", "data": data}
 
 
@@ -958,8 +995,8 @@ def get_fcs_company_financials(ticker: str) -> dict:
 """
 merged_market_data.py
 ----------------------
-Combines real_market_data.py (Twelve Data) and fcs_market_data.py (FCS
-API) into the three provider-agnostic functions node_logic.py's
+Combines real_market_data.py (Twelve Data) and alpha_vantage_market_data.py
+(Alpha Vantage) into the three provider-agnostic functions node_logic.py's
 `tools_node` actually calls for a real company — `get_merged_stock_price`,
 `get_merged_company_profile`, `get_merged_company_financials`. Same
 `{"ok": True/False, ...}` contract either single-provider module already
@@ -968,19 +1005,30 @@ uses, so nothing downstream has to know two providers were ever involved.
 Why two providers at all: Twelve Data's free plan is reliable for price
 but can't help with profile (`/profile` is paid-plan-only) or financials
 (no free fundamentals endpoint exists at all — see
-real_market_data.py's module docstring). FCS API's free plan covers
-exactly that gap (`/stock/profile`, `/stock/statistics`,
-`/stock/income_statements`), at the cost of a much tighter per-minute
-request quota. Neither provider is "better" — they're combined because
-each covers a hole the other has.
+real_market_data.py's module docstring). Alpha Vantage's free plan covers
+exactly that gap via its `OVERVIEW` function (sector, industry,
+description, address, website, plus TTM revenue/margin figures), at the
+cost of a much tighter overall request quota (25/day, not just
+per-minute). Neither provider is "better" — they're combined because each
+covers a hole the other has.
+
+NOTE on provider history: an earlier version of this module used FCS API
+(fcsapi.com) as the secondary provider. FCS API's own documentation did
+not flag its `/stock/profile` endpoint as requiring a paid plan, but a
+live test against a real FCS API free-tier key showed it rejects EVERY
+stock endpoint outright ("A Free API Key user cannot be used with
+stock/index endpoint. Please upgrade your plan.") — a documentation-vs-
+reality mismatch on FCS API's side, not a bug here. Alpha Vantage's free
+tier has no such endpoint-level gating (see alpha_vantage_market_data.py's
+module docstring), so it replaced FCS API as the secondary provider.
 
 Merge strategy, field by field, not provider by provider:
   - **Price**: Twelve Data is the primary and (on its free plan) already
-    reliable source. FCS API's `/stock/latest` is only called as a
+    reliable source. Alpha Vantage's `GLOBAL_QUOTE` is only called as a
     FALLBACK, when Twelve Data's call itself fails -- deliberately, to
-    conserve FCS API's especially tight 3-requests-per-minute free quota
+    conserve Alpha Vantage's especially tight 25-requests/day free quota
     for profile/financials, where Twelve Data's free plan can't help at
-    all and FCS API is actually needed every time.
+    all and Alpha Vantage is actually needed every time.
   - **Profile and financials**: both providers are queried, and the
     result is a FIELD-LEVEL merge, not a pick-one-provider merge. Twelve
     Data's fields win where it actually has them (it's generally the
@@ -988,35 +1036,36 @@ Merge strategy, field by field, not provider by provider:
     have — either because its call failed outright (free-plan
     restriction) or because it simply doesn't return that field at all
     (Twelve Data's "financials" never includes real revenue/margin
-    figures, paid plan or not) — is filled in from FCS API instead. A
-    field is never silently dropped and never fabricated: it's either a
+    figures, paid plan or not) — is filled in from Alpha Vantage instead.
+    A field is never silently dropped and never fabricated: it's either a
     real number from one of the two providers, or absent.
   - The merged result's `source` field names every provider that actually
     contributed at least one field this turn (e.g. "twelvedata.com +
-    fcsapi.com (merged)"), and a `note` is appended naming which specific
-    fields came from the secondary provider -- so the transparency panel
-    stays honest about provenance, not just about success/failure.
+    alphavantage.co (live, merged)"), and a `note` is appended naming
+    which specific fields came from the secondary provider -- so the
+    transparency panel stays honest about provenance, not just about
+    success/failure.
 """
 
 import concurrent.futures
 
 # Deliberately "from X import name1, name2" rather than "import X as td" /
-# "import X as fcs": build_api_app.py and assemble_notebook.py inline this
+# "import X as av": build_api_app.py and assemble_notebook.py inline this
 # file's source directly into investment_research_api.py / the notebook
 # (stripping only "from <local module> import ..." lines, since the
 # functions end up sharing one flat namespace there, not a real importable
 # package) -- the same convention node_logic.py's own local-module imports
 # already follow. An "import X as td" alias would survive that stripping
 # unchanged and then fail at runtime wherever real_market_data.py /
-# fcs_market_data.py aren't ALSO deployed as sibling files next to
-# investment_research_api.py.
+# alpha_vantage_market_data.py aren't ALSO deployed as sibling files next
+# to investment_research_api.py.
 
 # Fields that describe the RESPONSE itself, not actual company data -- never
 # treated as a "field to merge", just regenerated fresh by _merge() itself.
 _META_FIELDS = ("source", "note")
 
 
-def _merge(primary: dict, secondary: dict, tool_name: str, secondary_label: str = "fcsapi.com") -> dict:
+def _merge(primary: dict, secondary: dict, tool_name: str, secondary_label: str = "alphavantage.co") -> dict:
     """Field-level merge of two {"ok": ..., "data": {...}} results for the
     SAME tool call. `primary`'s fields always win when present; anything
     `primary` is missing (its call failed entirely, or it succeeded but
@@ -1066,48 +1115,49 @@ def _merge(primary: dict, secondary: dict, tool_name: str, secondary_label: str 
 
 
 def get_merged_stock_price(ticker: str) -> dict:
-    """Twelve Data's /quote first; FCS API's /stock/latest ONLY as a
+    """Twelve Data's /quote first; Alpha Vantage's GLOBAL_QUOTE ONLY as a
     fallback if that fails. See module docstring for why this one isn't a
     field-level merge like profile/financials are."""
     primary = get_real_stock_price(ticker)
     if primary.get("ok"):
         return primary
-    fallback = get_fcs_stock_price(ticker)
+    fallback = get_alpha_vantage_stock_price(ticker)
     if fallback.get("ok"):
-        fallback["data"]["note"] = f"Twelve Data unavailable this turn ({primary.get('error')}); using FCS API instead."
+        fallback["data"]["note"] = f"Twelve Data unavailable this turn ({primary.get('error')}); using Alpha Vantage instead."
         return fallback
     return {
         "ok": False,
         "tool": "get_stock_price",
-        "error": f"twelvedata:{primary.get('error')}; fcsapi.com:{fallback.get('error')}",
+        "error": f"twelvedata:{primary.get('error')}; alphavantage.co:{fallback.get('error')}",
     }
 
 
 def get_merged_company_profile(ticker: str) -> dict:
-    """Twelve Data + FCS API's /stock/profile, run concurrently (two
+    """Twelve Data + Alpha Vantage's OVERVIEW, run concurrently (two
     different providers, no shared cache or rate limit to serialize for)
     and merged field by field."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         td_future = pool.submit(get_real_company_profile, ticker)
-        fcs_future = pool.submit(get_fcs_company_profile, ticker)
+        av_future = pool.submit(get_alpha_vantage_company_profile, ticker)
         td_result = td_future.result()
-        fcs_result = fcs_future.result()
-    return _merge(td_result, fcs_result, "get_company_profile")
+        av_result = av_future.result()
+    return _merge(td_result, av_result, "get_company_profile")
 
 
 def get_merged_company_financials(ticker: str) -> dict:
     """Twelve Data's financials (company-profile fields only, reused from
-    its cached /profile response -- see real_market_data.py) + FCS API's
-    real revenue/margin figures (/stock/statistics +
-    /stock/income_statements), merged field by field. FCS API is the only
-    source of actual financial-statement data here; Twelve Data's free
-    plan has none at all, paid plan or not."""
+    its cached /profile response -- see real_market_data.py) + Alpha
+    Vantage's real revenue/margin figures (from the same OVERVIEW call
+    get_merged_company_profile uses, shared via alpha_vantage_market_data's
+    own cache), merged field by field. Alpha Vantage is the only source of
+    actual financial-statement data here; Twelve Data's free plan has none
+    at all, paid plan or not."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         td_future = pool.submit(get_real_company_financials, ticker)
-        fcs_future = pool.submit(get_fcs_company_financials, ticker)
+        av_future = pool.submit(get_alpha_vantage_company_financials, ticker)
         td_result = td_future.result()
-        fcs_result = fcs_future.result()
-    return _merge(td_result, fcs_result, "get_company_financials")
+        av_result = av_future.result()
+    return _merge(td_result, av_result, "get_company_financials")
 
 
 # =============================================================================
@@ -1907,11 +1957,11 @@ from typing import Optional
 # known_real_companies) still comes straight from real_market_data.py --
 # that part never involved a second provider. The three actual data calls
 # (price/profile/financials) go through merged_market_data.py instead,
-# which combines Twelve Data with FCS API: Twelve Data's free plan can't
-# serve company profile or any real financial-statement data at all (see
-# real_market_data.py's module docstring), so merged_market_data.py fills
-# those gaps in from FCS API field by field rather than reporting a
-# tool_failure for data a second provider genuinely has. See
+# which combines Twelve Data with Alpha Vantage: Twelve Data's free plan
+# can't serve company profile or any real financial-statement data at all
+# (see real_market_data.py's module docstring), so merged_market_data.py
+# fills those gaps in from Alpha Vantage field by field rather than
+# reporting a tool_failure for data a second provider genuinely has. See
 # merged_market_data.py's module docstring for the full merge strategy.
 
 
@@ -2187,9 +2237,10 @@ def tools_node(state: dict) -> dict:
         # pool below has resolved guarantees that cache hit instead of
         # racing the profile call for the same ticker. merged_market_data.py
         # itself already parallelizes each of these three calls' own two
-        # providers (Twelve Data + FCS API) internally — see its module
-        # docstring for the full merge strategy and why FCS API is only
-        # ever called as a price fallback, not on every price lookup.
+        # providers (Twelve Data + Alpha Vantage) internally — see its
+        # module docstring for the full merge strategy and why Alpha
+        # Vantage is only ever called as a price fallback, not on every
+        # price lookup.
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             profile_future = pool.submit(get_merged_company_profile, ticker)
             price_future = pool.submit(get_merged_stock_price, ticker)

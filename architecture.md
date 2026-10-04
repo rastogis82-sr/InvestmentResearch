@@ -167,8 +167,8 @@ using a free, no-credit-card `TWELVEDATA_API_KEY`.
   price_fn = get_merged_stock_price if is_real_company else get_stock_price
   ```
   The `get_merged_*` functions (`merged_market_data.py`, see Section 5c)
-  are what actually call Twelve Data — as of Section 5c they also call FCS
-  API and merge the two, but `tools_node` itself doesn't know or care;
+  are what actually call Twelve Data — as of Section 5c they also call
+  Alpha Vantage and merge the two, but `tools_node` itself doesn't know or care;
   it's still a two-way dispatch on `is_real_company`, same as when there
   was only one real-data provider. No other node changes shape to support
   this — `reconcile_node`,
@@ -191,9 +191,9 @@ using a free, no-credit-card `TWELVEDATA_API_KEY`.
   just say so" contract, now holding up against a real API's real plan
   restrictions instead of a simulated failure, rather than being treated
   as a bug to work around. **This specific gap is what Section 5c's second
-  provider (FCS API) closes** — Twelve Data alone still has it; the
+  provider (Alpha Vantage) closes** — Twelve Data alone still has it; the
   `get_merged_*` functions `tools_node` actually calls do not, as long as
-  `FCS_API_KEY` is also set.
+  `ALPHA_VANTAGE_API_KEY` is also set.
 - **Real companies will always show `rag_failure`:** the synthetic corpus
   only contains documents about ABC/XYZ/DEF, so any real-company question
   correctly flags no matching document found — this is expected, not an
@@ -222,7 +222,7 @@ using a free, no-credit-card `TWELVEDATA_API_KEY`.
 
 ---
 
-## 5c. Closing the data gap: a second provider (FCS API), merged field by field
+## 5c. Closing the data gap: a second provider (Alpha Vantage), merged field by field
 
 Section 5b's honest limitation — Twelve Data's free plan can't serve
 company profile at all, and has no fundamentals/income-statement endpoint
@@ -230,107 +230,137 @@ on *any* plan tier used here — meant a real-company "financials" question
 almost always either failed outright (`plan_restricted`) or "succeeded"
 with no actual revenue/margin numbers in it (`get_real_company_financials`
 reuses `/profile`'s company-level fields and says so explicitly). Adding a
-second, independent live-data provider — FCS API's Stock Market API
-(https://fcsapi.com/document/stock-api), free signup, no credit card —
-closes that gap without touching anything about how Twelve Data itself
-works.
+second, independent live-data provider closes that gap without touching
+anything about how Twelve Data itself works.
 
-- **`fcs_market_data.py`** is the direct FCS API counterpart to
+**Provider history — why this section no longer names FCS API.** The
+first version of this integration used FCS API's Stock Market API
+(fcsapi.com) as the secondary provider, based on its own published
+documentation, which did not flag `/stock/profile` as requiring a paid
+plan (unlike `/stock/earnings`, explicitly marked "Stock Corporate+" on
+FCS's own pricing page). A live test against a real FCS API free-tier key
+during deployment testing showed the opposite: FCS API's free plan
+rejects **every** stock endpoint outright — `"A Free API Key user cannot
+be used with stock/index endpoint. Please upgrade your plan."` — a
+documentation-vs-reality mismatch on FCS API's side, not a bug in this
+project's request/response handling (the merge code reported both
+providers' real failures honestly; it just had nothing to merge once FCS
+API's call failed every time). Alpha Vantage replaced FCS API as the
+secondary provider because its free tier has no endpoint-level gating:
+every function works on a free key, the only constraint is a request-
+count ceiling. `fcs_market_data.py` and `test_fcs_market_data.py` were
+deleted rather than kept alongside the new module, since a secondary
+provider that cannot be used on a free plan has no reason to stay in the
+codebase.
+
+- **`alpha_vantage_market_data.py`** is the Alpha Vantage counterpart to
   `real_market_data.py` — same never-raise `{"ok": ..., "tool": ...,
   "data"/"error": ...}` contract, same request-level response cache
-  (`FCS_CACHE_TTL_SECONDS`, default 30s), same curated-ticker approach
-  (all six `REAL_COMPANIES` tickers happen to trade on NASDAQ, which FCS
-  API's exchange-qualified `symbol` parameter needs). It exposes
-  `get_fcs_stock_price` (`/stock/latest`), `get_fcs_company_profile`
-  (`/stock/profile` — sector, industry, HQ, description, employee count,
-  founding year, CEO, website, market cap, all on FCS API's **free**
-  plan, unlike Twelve Data's equivalent), and `get_fcs_company_financials`
-  (`/stock/statistics` for margins/P-E/market cap, plus
-  `/stock/income_statements` for actual revenue and net income, with a
-  genuine year-over-year revenue-growth figure computed here from the
-  latest two fiscal periods in that response — something neither provider
-  returns directly).
+  (`ALPHA_VANTAGE_CACHE_TTL_SECONDS`, default 120s — higher than the other
+  two modules' 30s default, because Alpha Vantage's quota is per-**day**,
+  not just per-minute, so a cached answer is worth holding onto longer).
+  It exposes `get_alpha_vantage_stock_price` (`GLOBAL_QUOTE`) and two
+  functions that both read from the **same** `OVERVIEW` call —
+  `get_alpha_vantage_company_profile` (sector, industry, address/country as
+  `hq`, description, website, market cap — all on Alpha Vantage's **free**
+  plan, unlike Twelve Data's equivalent) and
+  `get_alpha_vantage_company_financials` (revenue, gross/operating/net
+  margin, P/E ratio, EBITDA, and year-over-year revenue growth, all
+  derived from the same `OVERVIEW` response's trailing-twelve-month
+  fields). Calling `OVERVIEW` once per ticker and sharing it between
+  profile and financials via the module-level cache is deliberate: it
+  halves the number of requests spent against the tight 25-requests/day
+  free ceiling compared to two separate endpoint calls. `net_income_usd_m`
+  is the one calculated field here (`RevenueTTM × ProfitMargin` — Alpha
+  Vantage's `OVERVIEW` has no direct net-income field), and is labeled as
+  calculated in the result's `note` so the transparency panel never
+  implies it's a raw reported figure.
 - **`merged_market_data.py`** is what `tools_node` actually calls for a
   real company now (`get_merged_stock_price` / `get_merged_company_profile`
   / `get_merged_company_financials`) — it combines the two single-provider
   modules' output, field by field, not provider by provider:
-  - **Price**: Twelve Data's `/quote` first; FCS API's `/stock/latest`
-    only as a **fallback** if that call fails. Twelve Data's free plan is
-    already reliable for price, so there's no reason to spend any of FCS
-    API's much tighter free-tier quota (3 requests/minute, 500/month —
-    see `fcs_market_data.py`'s module docstring) on a call that would
-    almost always just duplicate data Twelve Data already provided.
+  - **Price**: Twelve Data's `/quote` first; Alpha Vantage's
+    `GLOBAL_QUOTE` only as a **fallback** if that call fails. Twelve
+    Data's free plan is already reliable for price, so there's no reason
+    to spend any of Alpha Vantage's much tighter free-tier quota (25
+    requests/day — see `alpha_vantage_market_data.py`'s module docstring)
+    on a call that would almost always just duplicate data Twelve Data
+    already provided.
   - **Profile and financials**: both providers are called (concurrently,
     via a `ThreadPoolExecutor`), and the two results are merged field by
     field — Twelve Data's value wins wherever it actually has one; any
     field Twelve Data is missing, whether because its call failed
     outright or because it simply never returns that field at all (true
     of every financials field except the profile-derived ones), is filled
-    in from FCS API. A field is never silently dropped and never
+    in from Alpha Vantage. A field is never silently dropped and never
     invented — it's either a real number from one of the two providers,
-    or genuinely absent from both.
+    or genuinely absent from both. (Alpha Vantage's `OVERVIEW` has no
+    employee count, CEO name, or founding year fields at all — those
+    fields simply don't appear in the merged result anymore, rather than
+    being fabricated or carried over from the old FCS-based version.)
   - The merged `data.source` names every provider that actually
-    contributed a field this turn (e.g. `"twelvedata.com + fcsapi.com
-    (live, merged)"`, or just `"fcsapi.com (live)"` if Twelve Data's call
-    failed entirely), and `data.note` lists which specific fields were
-    filled in from the secondary provider — the transparency panel (both
-    the Gradio and React UIs) renders both of these as-is, so provenance
-    stays visible, not just success/failure.
-  - Partial success is still success at every layer: `fcs_market_data.py`'s
-    financials call returns `ok=True` with whatever `/stock/statistics` or
-    `/stock/income_statements` individually provided even if the other one
-    failed (e.g. a free-plan restriction on just one of the two), and
-    `merged_market_data.py`'s merge only reports `ok=False` if **both**
+    contributed a field this turn (e.g. `"twelvedata.com + alphavantage.co
+    (live, merged)"`, or just `"alphavantage.co (live)"` if Twelve Data's
+    call failed entirely), and `data.note` lists which specific fields
+    were filled in from the secondary provider — the transparency panel
+    (both the Gradio and React UIs) renders both of these as-is, so
+    provenance stays visible, not just success/failure.
+  - `merged_market_data.py`'s merge only reports `ok=False` if **both**
     providers failed completely — the system degrades by losing specific
-    fields, never by losing the whole answer when partial real data exists.
-- **New fields reaching the UI**: `ceo`, `website`, `founded`,
-  `market_cap_usd_b`, `pe_ratio`, and (now genuinely populated)
+    fields, never by losing the whole answer when partial real data
+    exists.
+- **New fields reaching the UI**: `website`, `market_cap_usd_b`,
+  `pe_ratio`, `ebitda_usd_m`, and (now genuinely populated)
   `revenue_usd_m` / `net_income_usd_m` / `revenue_growth_yoy_pct` /
   `net_margin_pct` / `gross_margin_pct` / `operating_margin_pct` all flow
   through the existing generic tool-card rendering in both `gradio_app.py`
   and `react-ui/src/components/ToolCard.tsx` with no UI restructuring
-  needed — only `_format_value`/`_humanize_key` (and their TypeScript
-  ports in `react-ui/src/format.ts`) needed two additions, kept identical
-  across both: a `_usd_b` suffix that auto-scales to `$X.XXT` above
-  $1,000B (`market_cap_usd_b` for a company the size of Apple would
-  otherwise print as an unwieldy `$3,806.3B`), and a small acronym-fixup
-  table (`ceo` → `CEO`, `pe_ratio` → `P/E Ratio`, `hq` → `HQ`) applied
-  after the existing title-casing step. `founded` is deliberately kept as
-  a *string*, not a number, in `fcs_market_data.py` — passing a year like
-  `1976` through the generic numeric formatter would render it
-  `"1,976"`.
+  needed — `_format_value`/`_humanize_key` (and their TypeScript ports in
+  `react-ui/src/format.ts`) already had the two additions this needed from
+  the earlier FCS-based version, kept identical across both: a `_usd_b`
+  suffix that auto-scales to `$X.XXT` above $1,000B (`market_cap_usd_b`
+  for a company the size of Apple would otherwise print as an unwieldy
+  `$3,806.3B`), and a small acronym-fixup table (`pe_ratio` → `P/E Ratio`,
+  `hq` → `HQ`) applied after the existing title-casing step.
 - **Degrades independently, not as a package deal**: `TWELVEDATA_API_KEY`
-  and `FCS_API_KEY` are two unrelated optional environment variables (see
-  `RENDER_DEPLOY.md`). Set both for the richest merged data; set either
-  alone and `merged_market_data.py` just uses that one provider's fields
-  (the other's "call" is a clean, free, instant `missing_..._api_key`
-  failure, not a network call); set neither and real-company questions
-  get an honest `tool_failure`, exactly as before this section existed —
-  the synthetic ABC/XYZ/DEF path never calls either provider regardless.
-- **Honest limitations, specific to FCS API**: its free plan's
-  3-requests-per-minute cap is tight enough that two real-company
-  financials lookups inside the same minute can legitimately hit it — this
-  surfaces as an ordinary `rate_limited:...` tool failure, distinguished
-  from a plan restriction so it's clear from the flag alone that waiting a
-  minute (not upgrading a plan) is the fix. The response shapes in
-  `fcs_market_data.py` are taken from FCS API's own published
-  documentation examples, not verified against the live API — this
-  sandbox has no outbound network access to third-party APIs to test
-  against, the same constraint `real_market_data.py` was built under.
-  Smoke-test both `fcs_market_data.py`'s and `merged_market_data.py`'s
-  `__main__` blocks with real keys in Colab before relying on this in
-  front of a grader.
-- Verified with 37 unit tests in `test_fcs_market_data.py` (mocked
-  `requests.get` against FCS API's documented example response shapes —
-  success, missing key, rate limiting, an auth error, a network timeout,
-  the response-cache behavior, and the statistics-succeeds-but-
-  income-statements-fails partial case) and 26 unit tests in
-  `test_merged_market_data.py` (the merge logic itself, using hand-built
-  provider results rather than mocked HTTP — Twelve Data succeeding alone,
-  FCS API succeeding alone, both succeeding with Twelve Data's fields
-  correctly winning and FCS API only filling genuine gaps, and both
-  failing) — **63/63 pass**, plus `test_real_market_data.py` (35/35) and
-  `test_harness.py` (23/23) both confirmed still passing unchanged.
+  and `ALPHA_VANTAGE_API_KEY` are two unrelated optional environment
+  variables (see `RENDER_DEPLOY.md`). Set both for the richest merged
+  data; set either alone and `merged_market_data.py` just uses that one
+  provider's fields (the other's "call" is a clean, free, instant
+  `missing_..._api_key` failure, not a network call); set neither and
+  real-company questions get an honest `tool_failure`, exactly as before
+  this section existed — the synthetic ABC/XYZ/DEF path never calls either
+  provider regardless.
+- **Honest limitations, specific to Alpha Vantage**: its free plan's
+  25-requests-per-**day** cap (not just per-minute) is tight enough that a
+  handful of real-company lookups in a single demo session can exhaust it
+  for the rest of the day — this surfaces as an ordinary `rate_limited:...`
+  tool failure (Alpha Vantage signals this with a `"Note"` key inside an
+  otherwise-200-OK response body, not an HTTP status code — handled
+  explicitly in `_alpha_vantage_get`, along with an `"Information"` key for
+  a bad/demo API key and an `"Error Message"` key for a bad symbol). The
+  response shapes in `alpha_vantage_market_data.py` are taken from Alpha
+  Vantage's own published documentation and its GAAP fundamentals field
+  reference, not verified against the live API — this sandbox has no
+  outbound network access to third-party APIs to test against, the same
+  constraint `real_market_data.py` and the earlier FCS-based module were
+  built under. Smoke-test both `alpha_vantage_market_data.py`'s and
+  `merged_market_data.py`'s `__main__` blocks with a real key in Colab
+  before relying on this in front of a grader.
+- Verified with 45 unit tests in `test_alpha_vantage_market_data.py`
+  (mocked `requests.get` against Alpha Vantage's documented example
+  response shapes — success, missing key, rate limiting via the `"Note"`
+  body key, an invalid/demo API key via the `"Information"` body key, a
+  bad symbol returning an empty `{}`, the literal string `"None"` standing
+  in for a missing field, a network timeout, the response-cache behavior,
+  and the OVERVIEW-shared-between-profile-and-financials cache reuse) and
+  26 unit tests in `test_merged_market_data.py` (the merge logic itself,
+  using hand-built provider results rather than mocked HTTP — Twelve Data
+  succeeding alone, Alpha Vantage succeeding alone, both succeeding with
+  Twelve Data's fields correctly winning and Alpha Vantage only filling
+  genuine gaps, and both failing) — **71/71 pass**, plus
+  `test_real_market_data.py` (35/35) and `test_harness.py` (23/23) both
+  confirmed still passing unchanged.
 
 ---
 
@@ -487,8 +517,8 @@ NGROK_AUTH_TOKEN=your_ngrok_token_here
 | `IRA_CORPUS_DIR` | `/tmp/investment_research_kb` | Where the synthetic knowledge base is written before indexing. |
 | `TWELVEDATA_API_KEY` | unset | Optional. Enables real-company (AAPL/MSFT/GOOGL/AMZN/TSLA/NVDA) market data via Twelve Data — see Section 5b. Unset or missing just makes real-company tool calls fail cleanly (`missing_twelvedata_api_key`); the synthetic ABC/XYZ/DEF universe is unaffected either way. |
 | `TWELVEDATA_CACHE_TTL_SECONDS` | `"30"` | How long a Twelve Data response is cached in memory before a repeat call re-hits the network — see Section 9b. Set to `"0"` to disable caching entirely. |
-| `FCS_API_KEY` | unset | Optional, independent of `TWELVEDATA_API_KEY`. Fills in company profile and real financial-statement data Twelve Data's free plan can't provide at all — see Section 5c. Unset just means `merged_market_data.py` uses whatever Twelve Data alone returned. |
-| `FCS_CACHE_TTL_SECONDS` | `"30"` | Same purpose as `TWELVEDATA_CACHE_TTL_SECONDS`, for FCS API's response cache — see Section 5c's note on its tighter free-tier rate limit. |
+| `ALPHA_VANTAGE_API_KEY` | unset | Optional, independent of `TWELVEDATA_API_KEY`. Fills in company profile and real financial-statement data Twelve Data's free plan can't provide at all — see Section 5c. Unset just means `merged_market_data.py` uses whatever Twelve Data alone returned. |
+| `ALPHA_VANTAGE_CACHE_TTL_SECONDS` | `"120"` | Same purpose as `TWELVEDATA_CACHE_TTL_SECONDS`, for Alpha Vantage's response cache — higher default than the other two modules' 30s, since Alpha Vantage's quota is per-day, not just per-minute; see Section 5c. |
 
 ### Endpoints
 
@@ -855,12 +885,12 @@ dashboard steps):
   --port 10000`), `healthCheckPath: /health`, and the full set of
   environment variables the app reads. Non-secret config (`MOCK_LLM`,
   `LLM_PROVIDER`, `IRA_SCORE_THRESHOLD`, `TWELVEDATA_CACHE_TTL_SECONDS`,
-  `FCS_CACHE_TTL_SECONDS`) is inlined directly in the file since there's
-  nothing sensitive about it; every actual secret (`OPENAI_API_KEY`,
-  `ANTHROPIC_API_KEY`, `OPENAI_BASE_URL`, `TWELVEDATA_API_KEY`,
-  `FCS_API_KEY`) is declared with `sync: false`, which makes Render
-  prompt for the value in its dashboard rather than storing it in this
-  version-controlled file.
+  `ALPHA_VANTAGE_CACHE_TTL_SECONDS`) is inlined directly in the file since
+  there's nothing sensitive about it; every actual secret
+  (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_BASE_URL`,
+  `TWELVEDATA_API_KEY`, `ALPHA_VANTAGE_API_KEY`) is declared with
+  `sync: false`, which makes Render prompt for the value in its dashboard
+  rather than storing it in this version-controlled file.
 - `.env.example` — a template (placeholder values only) documenting every
   config key the app reads, for local/Vocareum testing.
 - `.gitignore` — excludes `.env`, `__pycache__/`, and other local-only

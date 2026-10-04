@@ -260,9 +260,9 @@ def _format_value(key: str, value) -> str:
             # Always 2 decimal places -- a real TwelveData percent_change
             # (e.g. 0.922395) must not render as "+0.922395%".
             return f"{value:+.2f}%"
-        # market_cap_usd_b (from FCS API, see fcs_market_data.py) is
-        # already in BILLIONS -- auto-scale to trillions above 1000 rather
-        # than printing an unwieldy "$3,806.3B" for a company like Apple.
+        # market_cap_usd_b (from Alpha Vantage, see alpha_vantage_market_data.py)
+        # is already in BILLIONS -- auto-scale to trillions above 1000
+        # rather than printing an unwieldy "$3,806.3B" for a company like Apple.
         if key_l.endswith("_usd_b"):
             if abs(value) >= 1000:
                 return f"${value / 1000:,.2f}T"

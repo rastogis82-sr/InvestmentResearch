@@ -23,7 +23,7 @@ import json
 import re
 import base64
 
-LOCAL_MODULES = ["guardrails", "schemas", "tools_mock", "corpus", "node_logic", "mock_llm", "local_retriever", "real_market_data", "fcs_market_data", "merged_market_data"]
+LOCAL_MODULES = ["guardrails", "schemas", "tools_mock", "corpus", "node_logic", "mock_llm", "local_retriever", "real_market_data", "alpha_vantage_market_data", "merged_market_data"]
 
 
 def load_and_clean(path: str) -> str:
@@ -177,12 +177,13 @@ Field reference:
   placeholder to skip it; real-company questions then just get a clean
   "missing API key" tool failure instead of live data, and ABC/XYZ/DEF
   are completely unaffected either way.
-- `FCS_API_KEY` — optional, independent of `TWELVEDATA_API_KEY` above.
-  Fills in company profile and real financial-statement data (revenue,
-  margins, YoY growth) that Twelve Data's free plan can't provide at
-  all — see Sections 1c/1d. Free signup, no credit card:
-  https://fcsapi.com/pricing. Leave the placeholder to skip it; real
-  companies then just use whatever Twelve Data alone returned.
+- `ALPHA_VANTAGE_API_KEY` — optional, independent of `TWELVEDATA_API_KEY`
+  above. Fills in company profile and real financial-statement data
+  (revenue, margins, YoY growth) that Twelve Data's free plan can't
+  provide at all — see Sections 1c/1d. Free signup, no credit card:
+  https://www.alphavantage.co/support/#api-key (free tier: 25
+  requests/day). Leave the placeholder to skip it; real companies then
+  just use whatever Twelve Data alone returned.
 
 > **Security note:** `.env` is written to the ephemeral Colab VM's local
 > disk only (not your Google Drive) and disappears when the runtime
@@ -198,7 +199,7 @@ LANGCHAIN_TRACING_V2=true
 NGROK_AUTH_TOKEN=your_ngrok_token_here
 NGROK_DOMAIN=your_ngrok_domain_here
 TWELVEDATA_API_KEY=your_twelvedata_api_key_here
-FCS_API_KEY=your_fcs_api_key_here'''))
+ALPHA_VANTAGE_API_KEY=your_alpha_vantage_api_key_here'''))
 
 cells.append(code('''import os
 from getpass import getpass
@@ -286,13 +287,13 @@ if _is_placeholder(os.environ.get("TWELVEDATA_API_KEY", "")):
 else:
     print("Real-company market data (Twelve Data): enabled")
 
-if _is_placeholder(os.environ.get("FCS_API_KEY", "")):
-    os.environ.pop("FCS_API_KEY", None)
-    print("Real-company market data (FCS API): disabled (no FCS_API_KEY in .env)")
+if _is_placeholder(os.environ.get("ALPHA_VANTAGE_API_KEY", "")):
+    os.environ.pop("ALPHA_VANTAGE_API_KEY", None)
+    print("Real-company market data (Alpha Vantage): disabled (no ALPHA_VANTAGE_API_KEY in .env)")
 else:
-    print("Real-company market data (FCS API): enabled")
+    print("Real-company market data (Alpha Vantage): enabled")
 
-if not os.environ.get("TWELVEDATA_API_KEY") and not os.environ.get("FCS_API_KEY"):
+if not os.environ.get("TWELVEDATA_API_KEY") and not os.environ.get("ALPHA_VANTAGE_API_KEY"):
     print("-> Neither market-data provider configured: ABC/XYZ/DEF are unaffected; "
           "real-company questions will get a clean tool failure.")
 
@@ -349,7 +350,7 @@ into `tools_node` (Section 7) are the merged ones from Section 1d, not
 these Twelve Data functions directly.'''))
 cells.append(code(load_and_clean("real_market_data.py")))
 
-cells.append(md('''## 1c. Real-company market data, provider 2 (optional — FCS API)
+cells.append(md('''## 1c. Real-company market data, provider 2 (optional — Alpha Vantage)
 
 Section 1b's honest limitation is a real gap, not a one-off: Twelve
 Data's free plan can serve live price but nothing else for a real
@@ -358,48 +359,59 @@ any tier used here, so `get_company_financials` never returns an actual
 revenue or margin figure even when it technically "succeeds" (it just
 reuses `/profile`'s company-level fields and says so).
 
-[FCS API](https://fcsapi.com/document/stock-api) (free signup, no credit
-card) closes exactly that gap: its free plan includes `/stock/profile`
-(sector, industry, HQ, description, employee count, CEO, website, market
-cap) and enough of `/stock/statistics` + `/stock/income_statements` to
-recover real margins, P/E, and a genuine year-over-year revenue-growth
-figure (computed here from two fiscal periods in that response — neither
-provider returns growth directly).
+[Alpha Vantage](https://www.alphavantage.co/documentation/) (free
+signup, no credit card) closes exactly that gap: its `OVERVIEW` function
+returns company profile fields (sector, industry, address, website) AND
+trailing-twelve-month financial fields (revenue, gross/operating/net
+margin, EBITDA, P/E ratio, year-over-year revenue growth) in a **single**
+call — deliberately cached and shared between the profile and financials
+functions below, since Alpha Vantage's free tier is capped at 25
+requests/**day**, and one call covering both halves the quota spent per
+company looked up.
+
+*(An earlier version of this notebook used FCS API as provider 2. A live
+test against a real FCS API free-tier key showed it rejects every stock
+endpoint on the free plan, contradicting its own documentation — see
+`merged_market_data.py`'s module docstring for the full story. Alpha
+Vantage has no such endpoint-level gating on its free tier.)*
 
 This cell, on its own, is just a second single-provider module with the
 exact same `{"ok": True/False, ...}` contract as Section 1b's
 `real_market_data.py` — it doesn't combine the two providers itself. That
 happens in the next cell.
 
-**Honest limitation:** FCS API's free plan is capped at 3 requests/minute
-(tighter than Twelve Data's) and 500/month — two real-company financials
-lookups inside the same minute can legitimately hit that limit, surfaced
-as an ordinary `rate_limited:...` tool failure rather than a crash.'''))
-cells.append(code(load_and_clean("fcs_market_data.py")))
+**Honest limitation:** Alpha Vantage's free plan is capped at 25
+requests/**day** (not just per-minute) — a handful of real-company
+profile/financials lookups in one session can exhaust it for the rest of
+the day, surfaced as an ordinary `rate_limited:...` tool failure rather
+than a crash. `OVERVIEW` also has no employee count, CEO name, or
+founding year fields at all, unlike FCS API's old `/stock/profile` — those
+fields are just honestly absent now, never fabricated.'''))
+cells.append(code(load_and_clean("alpha_vantage_market_data.py")))
 
 cells.append(md('''## 1d. Combining both providers, field by field
 
 `merged_market_data.py` is what `tools_node` (Section 7) actually calls
-for a real company — not `real_market_data.py` or `fcs_market_data.py`
-directly. It combines the two providers' results **field by field, not
-provider by provider**: Twelve Data's value wins wherever it actually has
-one; any field Twelve Data is missing — its call failed outright, or it
-simply never returns that field at all (true of every real financials
-field) — is filled in from FCS API. A field is never silently dropped
-and never invented: it's either a real number from one of the two
-providers, or genuinely absent from both.
+for a real company — not `real_market_data.py` or
+`alpha_vantage_market_data.py` directly. It combines the two providers'
+results **field by field, not provider by provider**: Twelve Data's value
+wins wherever it actually has one; any field Twelve Data is missing — its
+call failed outright, or it simply never returns that field at all (true
+of every real financials field) — is filled in from Alpha Vantage. A
+field is never silently dropped and never invented: it's either a real
+number from one of the two providers, or genuinely absent from both.
 
 Price is handled differently from profile/financials: Twelve Data's
-`/quote` is tried first, and FCS API's `/stock/latest` is only called as
-a **fallback** if that fails — Twelve Data's free plan is already
-reliable for price, so there's no reason to spend any of FCS API's much
-tighter free-tier quota on a call that would almost always just duplicate
-data Twelve Data already provided.
+`/quote` is tried first, and Alpha Vantage's `GLOBAL_QUOTE` is only called
+as a **fallback** if that fails — Twelve Data's free plan is already
+reliable for price, so there's no reason to spend any of Alpha Vantage's
+much tighter free-tier quota on a call that would almost always just
+duplicate data Twelve Data already provided.
 
 The merged result's `source` field names every provider that actually
-contributed data this turn (e.g. `"twelvedata.com + fcsapi.com (live,
-merged)"`), and `note` lists which specific fields were filled in from
-the secondary provider — both render as-is in the transparency panel
+contributed data this turn (e.g. `"twelvedata.com + alphavantage.co
+(live, merged)"`), and `note` lists which specific fields were filled in
+from the secondary provider — both render as-is in the transparency panel
 (Section 11's Gradio UI, and the standalone React UI), so provenance
 stays visible, not just success/failure. Both market-data keys are
 independent and optional: set either, both, or neither in Section 0's
@@ -886,18 +898,19 @@ Not part of the graded 23-check suite above (it needs a real LLM and a
 real network call, neither of which is reproducible/offline), but a quick
 way to see the Section 1b-1d real-data integration actually working.
 Skips itself cleanly if `MOCK_LLM = True` or neither `TWELVEDATA_API_KEY`
-nor `FCS_API_KEY` was set — the question below asks about financials
-specifically so that, with only `TWELVEDATA_API_KEY` set, you can see its
-honest `plan_restricted` limitation first-hand; add a free `FCS_API_KEY`
-too (Section 1c) to see that gap actually close.'''))
+nor `ALPHA_VANTAGE_API_KEY` was set — the question below asks about
+financials specifically so that, with only `TWELVEDATA_API_KEY` set, you
+can see its honest `plan_restricted` limitation first-hand; add a free
+`ALPHA_VANTAGE_API_KEY` too (Section 1c) to see that gap actually
+close.'''))
 cells.append(code('''import json
 
 print("Optional live demo: a real company (Apple, Microsoft, Alphabet, Amazon, Tesla, NVIDIA)")
 if MOCK_LLM:
     print("Skipped — set MOCK_LLM = False in Section 0 to query a real LLM + real market data.")
-elif _is_placeholder(os.environ.get("TWELVEDATA_API_KEY", "")) and _is_placeholder(os.environ.get("FCS_API_KEY", "")):
-    print("Skipped — add a free TWELVEDATA_API_KEY and/or FCS_API_KEY to .env in Section 0 to enable this.")
-    print("Sign up free (no credit card) at https://twelvedata.com/pricing and/or https://fcsapi.com/pricing")
+elif _is_placeholder(os.environ.get("TWELVEDATA_API_KEY", "")) and _is_placeholder(os.environ.get("ALPHA_VANTAGE_API_KEY", "")):
+    print("Skipped — add a free TWELVEDATA_API_KEY and/or ALPHA_VANTAGE_API_KEY to .env in Section 0 to enable this.")
+    print("Sign up free (no credit card) at https://twelvedata.com/pricing and/or https://www.alphavantage.co/support/#api-key")
 else:
     result = chat("real_demo", "What's Apple's current stock price, revenue growth, and profit margins?")
     print(result["response"])
@@ -906,7 +919,7 @@ else:
     print(json.dumps(state.get("tool_results", {}), indent=2, default=str))
     print("\\nFlags:", state.get("flags", []))
     print("\\n(With only TWELVEDATA_API_KEY set, expect a tool_failure/plan_restricted note on")
-    print(" get_company_financials's revenue/margin fields — see Section 1b. Add a free FCS_API_KEY")
+    print(" get_company_financials's revenue/margin fields — see Section 1b. Add a free ALPHA_VANTAGE_API_KEY")
     print(" too (Section 1c) to see merged_market_data.py (Section 1d) fill those fields in instead.)")'''))
 
 # =============================================================================

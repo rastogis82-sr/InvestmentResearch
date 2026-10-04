@@ -15,8 +15,8 @@ services:
         value: "0.35"
       - key: TWELVEDATA_CACHE_TTL_SECONDS
         value: "30"
-      - key: FCS_CACHE_TTL_SECONDS
-        value: "30"
+      - key: ALPHA_VANTAGE_CACHE_TTL_SECONDS
+        value: "120"
       # --- Secrets: sync: false means Render will prompt for these in the
       # dashboard and never store the value in this file or in git. Set
       # them once under the service's Environment tab after it's created. ---
@@ -28,7 +28,7 @@ services:
         sync: false                   # optional — e.g. a Vocareum proxy URL instead of api.openai.com (used for both embeddings and chat)
       - key: TWELVEDATA_API_KEY
         sync: false                   # optional — enables real-company (AAPL/MSFT/...) live data
-      - key: FCS_API_KEY
+      - key: ALPHA_VANTAGE_API_KEY
         sync: false                   # optional — fills in profile/financials data Twelve Data's free plan can't provide; see merged_market_data.py
 
   # --- Second service: the Gradio chat UI, deployed separately from the
