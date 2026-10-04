@@ -1,3 +1,11 @@
-gradio>=4.0.0
+# gradio is pinned to an exact version on purpose -- same "never use
+# latest" rule as the Dockerfiles. An earlier unpinned `gradio>=4.0.0`
+# silently resolved to 6.29.1 on a Render rebuild, which broke the chat
+# panel: newer Gradio versions require gr.Chatbot's messages in the
+# {"role", "content"} dict format, not the older [user, bot] tuple-pairs
+# format gradio_app.py originally built. The code now uses the messages
+# format (type="messages"), and the version is pinned so a future
+# `pip install` can't silently jump to a different major release again.
+gradio==6.29.1
 requests>=2.31.0
 python-dotenv>=1.0.0
