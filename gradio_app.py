@@ -115,9 +115,12 @@ def _on_submit(message: str, history: list, session_id: str):
     else:
         response_text = f"⚠️ {result.get('error', 'Unknown error.')}"
 
-    # gr.Chatbot(type="messages") expects a flat list of {"role", "content"}
-    # dicts (OpenAI-style), not the old [[user, bot], ...] tuple-pairs
-    # format -- that older format was removed in newer Gradio releases.
+    # gr.Chatbot expects a flat list of {"role", "content"} dicts
+    # (OpenAI-style), not the old [[user, bot], ...] tuple-pairs format.
+    # In gradio==6.29.1 (pinned in requirements-gradio.txt) this is the
+    # *only* supported format -- Chatbot.__init__ doesn't even accept a
+    # `type=` kwarg anymore (that only existed in versions that still
+    # supported both formats), so there's nothing to select explicitly.
     history = history + [
         {"role": "user", "content": message},
         {"role": "assistant", "content": response_text},
@@ -154,7 +157,7 @@ with gr.Blocks(title="Investment Research Assistant") as demo:
 
     with gr.Row():
         with gr.Column(scale=2):
-            chatbot = gr.Chatbot(height=450, type="messages")
+            chatbot = gr.Chatbot(height=450)
             msg = gr.Textbox(
                 label="Your question",
                 placeholder="Research ABC Technologies: revenue growth and profitability.",
