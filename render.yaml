@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: investment-research-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn investment_research_api:app --host 0.0.0.0 --port 10000
+    healthCheckPath: /health
+    envVars:
+      # --- Non-secret config: safe to version-control, inline here ---
+      - key: MOCK_LLM
+        value: "false"
+      - key: LLM_PROVIDER
+        value: "openai:gpt-4o-mini"
+      - key: IRA_SCORE_THRESHOLD
+        value: "0.35"
+      - key: TWELVEDATA_CACHE_TTL_SECONDS
+        value: "30"
+      # --- Secrets: sync: false means Render will prompt for these in the
+      # dashboard and never store the value in this file or in git. Set
+      # them once under the service's Environment tab after it's created. ---
+      - key: OPENAI_API_KEY
+        sync: false                   # required unless LLM_PROVIDER uses anthropic
+      - key: ANTHROPIC_API_KEY
+        sync: false                   # only needed if LLM_PROVIDER starts with "anthropic:"
+      - key: OPENAI_BASE_URL
+        sync: false                   # optional — e.g. a Vocareum proxy URL instead of api.openai.com
+      - key: TWELVEDATA_API_KEY
+        sync: false                   # optional — enables real-company (AAPL/MSFT/...) live data
