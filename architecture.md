@@ -347,20 +347,35 @@ codebase.
   built under. Smoke-test both `alpha_vantage_market_data.py`'s and
   `merged_market_data.py`'s `__main__` blocks with a real key in Colab
   before relying on this in front of a grader.
-- Verified with 45 unit tests in `test_alpha_vantage_market_data.py`
+- **A real misclassification bug, caught live and fixed.** The first
+  deployed version of `_alpha_vantage_get` classified any `"Information"`-
+  body message containing the substring `"api key"` as `invalid_api_key`.
+  A live Render deployment test then hit Alpha Vantage's actual
+  daily-quota-exceeded message — `"We have detected your API key as
+  <KEY> and our standard API rate limit is 25 requests per day..."` —
+  which contains that exact substring, so a perfectly valid key that had
+  simply used up its free 25-requests/day quota was misreported as
+  invalid. Fixed by checking for rate-limit phrases (`"rate limit"`,
+  `"requests per day"`, `"requests per minute"`) **before** the
+  invalid-key check, since those phrases are specific to the quota
+  message and "demo" is specific to the actual invalid-key message. A
+  regression test (`test_alpha_vantage_market_data.py`, using the exact
+  message text from the live response) now locks this in.
+- Verified with 47 unit tests in `test_alpha_vantage_market_data.py`
   (mocked `requests.get` against Alpha Vantage's documented example
   response shapes — success, missing key, rate limiting via the `"Note"`
-  body key, an invalid/demo API key via the `"Information"` body key, a
-  bad symbol returning an empty `{}`, the literal string `"None"` standing
-  in for a missing field, a network timeout, the response-cache behavior,
-  and the OVERVIEW-shared-between-profile-and-financials cache reuse) and
-  26 unit tests in `test_merged_market_data.py` (the merge logic itself,
-  using hand-built provider results rather than mocked HTTP — Twelve Data
-  succeeding alone, Alpha Vantage succeeding alone, both succeeding with
-  Twelve Data's fields correctly winning and Alpha Vantage only filling
-  genuine gaps, and both failing) — **71/71 pass**, plus
-  `test_real_market_data.py` (35/35) and `test_harness.py` (23/23) both
-  confirmed still passing unchanged.
+  body key, the daily-quota-exceeded message via the `"Information"` body
+  key (the regression test above), an invalid/demo API key also via
+  `"Information"`, a bad symbol returning an empty `{}`, the literal
+  string `"None"` standing in for a missing field, a network timeout, the
+  response-cache behavior, and the OVERVIEW-shared-between-profile-and-
+  financials cache reuse) and 26 unit tests in `test_merged_market_data.py`
+  (the merge logic itself, using hand-built provider results rather than
+  mocked HTTP — Twelve Data succeeding alone, Alpha Vantage succeeding
+  alone, both succeeding with Twelve Data's fields correctly winning and
+  Alpha Vantage only filling genuine gaps, and both failing) — **73/73
+  pass**, plus `test_real_market_data.py` (35/35) and `test_harness.py`
+  (23/23) both confirmed still passing unchanged.
 
 ---
 

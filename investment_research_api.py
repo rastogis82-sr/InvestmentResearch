@@ -834,7 +834,18 @@ def _alpha_vantage_get(params: dict, tool_name: str, cache_key_suffix: str = "")
     if "Information" in payload:
         message = str(payload["Information"])
         message_l = message.lower()
-        if "api key" in message_l or "apikey" in message_l or "demo" in message_l:
+        # IMPORTANT, confirmed against a real live response: Alpha Vantage's
+        # own daily-quota-exceeded message is delivered under the
+        # "Information" key (not "Note"), and reads "We have detected your
+        # API key as <KEY> and our standard API rate limit is 25 requests
+        # per day...". That message contains the substring "api key", so
+        # the rate-limit phrases below MUST be checked first -- otherwise
+        # a real daily-quota hit gets misclassified as an invalid/bad key,
+        # which is actively misleading (the key is fine; the quota is
+        # exhausted for the day and will reset on its own).
+        if "rate limit" in message_l or "requests per day" in message_l or "requests per minute" in message_l:
+            result = {"ok": False, "error": f"rate_limited:{message}", "tool": tool_name}
+        elif "demo" in message_l:
             result = {"ok": False, "error": f"invalid_api_key:{message}", "tool": tool_name}
         else:
             result = {"ok": False, "error": f"api_error:{message}", "tool": tool_name}

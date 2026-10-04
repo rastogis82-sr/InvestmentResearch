@@ -176,6 +176,28 @@ with patch.dict(os.environ, {"ALPHA_VANTAGE_API_KEY": "fake-key"}, clear=False):
         check("rate limited: labeled as rate_limited", str(r.get("error", "")).startswith("rate_limited"))
 
 # ---------------------------------------------------------------------------
+# Daily-quota-exceeded message delivered under "Information" (not "Note")
+# -- confirmed against a REAL live Alpha Vantage response during deployment
+# testing. The message contains the substring "api key" ("We have detected
+# your API key as ...") which must NOT cause this to be misclassified as
+# invalid_api_key -- the key is fine, the 25-requests/day quota is just
+# exhausted for the day. This is a regression test for a real
+# misclassification bug this project shipped and then caught live.
+# ---------------------------------------------------------------------------
+DAILY_QUOTA_EXCEEDED = {
+    "Information": "We have detected your API key as XMSI2RW37VA28OP7 and our standard API "
+    "rate limit is 25 requests per day. Please subscribe to any of the premium plans at "
+    "https://www.alphavantage.co/premium/ to instantly remove all daily rate limits."
+}
+av.clear_cache()
+with patch.dict(os.environ, {"ALPHA_VANTAGE_API_KEY": "real-but-exhausted-key"}, clear=False):
+    with patch("alpha_vantage_market_data._SESSION.get", return_value=_mock_response(DAILY_QUOTA_EXCEEDED)):
+        r = av.get_alpha_vantage_stock_price("AAPL")
+        check("daily quota exceeded: ok=False", r["ok"] is False)
+        check("daily quota exceeded: labeled as rate_limited, NOT invalid_api_key",
+              str(r.get("error", "")).startswith("rate_limited"))
+
+# ---------------------------------------------------------------------------
 # Invalid / demo API key -- Alpha Vantage signals this with an
 # "Information" key inside a 200 OK body.
 # ---------------------------------------------------------------------------
