@@ -1,0 +1,50 @@
+# Investment Research Assistant -- local Docker Compose stack
+#
+# Brings up both containers together: the API and the Gradio UI, wired to
+# each other over the Compose-managed network. This is the Docker
+# equivalent of what Render does with two separate Web Services, except
+# here the Gradio container reaches the API container by its Compose
+# *service name* ("api") rather than a public URL -- no ngrok, no
+# deployed Render instance needed to develop or demo locally.
+#
+# Usage:
+#   cp .env.example .env   # fill in real values -- see that file's comments
+#   docker compose up --build
+#   -> API:    http://localhost:8000
+#   -> Gradio: http://localhost:7860
+#
+# Config is still environment-only: the api service reads its secrets
+# from .env (never baked into the image -- see .dockerignore), and the
+# gradio service's API_BASE_URL is set here to the Compose network
+# address, not hardcoded in gradio_app.py.
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    image: investment-research-api:v1
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  gradio:
+    build:
+      context: .
+      dockerfile: Dockerfile.gradio
+    image: investment-research-gradio:v1
+    ports:
+      - "7860:7860"
+    environment:
+      API_BASE_URL: "http://api:8000"
+      PORT: "7860"
+    depends_on:
+      api:
+        condition: service_healthy

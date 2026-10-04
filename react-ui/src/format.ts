@@ -20,17 +20,32 @@ export function humanizeFlag(flag: string): string {
   return flag.replace(/_/g, " ").replace(/:/g, " — ");
 }
 
+// Small set of acronyms/abbreviations title-casing mangles (e.g. "Ceo"
+// instead of "CEO") -- applied after title-casing. Kept identical to
+// gradio_app.py's _KEY_LABEL_FIXUPS so both UIs render the same labels
+// for fields contributed by fcs_market_data.py (ceo, pe_ratio, hq).
+const KEY_LABEL_FIXUPS: Record<string, string> = {
+  Yoy: "YoY",
+  Ceo: "CEO",
+  "Pe Ratio": "P/E Ratio",
+  Hq: "HQ",
+};
+
 export function humanizeKey(key: string): string {
   let base = key;
-  for (const suffix of ["_usd_m", "_usd", "_pct"]) {
+  // Longer/more specific suffixes checked before shorter ones, same
+  // ordering discipline as gradio_app.py's _humanize_key.
+  for (const suffix of ["_usd_b", "_usd_m", "_usd", "_pct"]) {
     if (base.endsWith(suffix)) {
       base = base.slice(0, -suffix.length);
       break;
     }
   }
-  const label = titleCase(base.replace(/_/g, " ").trim());
-  const fixed = label.replace(/Yoy/g, "YoY");
-  return fixed || key;
+  let label = titleCase(base.replace(/_/g, " ").trim());
+  for (const [wrong, right] of Object.entries(KEY_LABEL_FIXUPS)) {
+    label = label.split(wrong).join(right);
+  }
+  return label || key;
 }
 
 export function humanizeTool(name: string): string {
@@ -55,6 +70,16 @@ export function formatValue(key: string, value: unknown): string {
     if (keyL.endsWith("_pct")) {
       const sign = value >= 0 ? "+" : "";
       return `${sign}${value.toFixed(2)}%`;
+    }
+    // market_cap_usd_b (from FCS API, see fcs_market_data.py) is already
+    // in BILLIONS -- auto-scale to trillions above 1000, same as
+    // gradio_app.py's _format_value, rather than printing an unwieldy
+    // "$3,806.3B" for a company the size of Apple.
+    if (keyL.endsWith("_usd_b")) {
+      if (Math.abs(value) >= 1000) {
+        return `$${(value / 1000).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}T`;
+      }
+      return `$${value.toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 })}B`;
     }
     if (keyL.includes("usd") || keyL.endsWith("_low") || keyL.endsWith("_high")) {
       if (keyL.endsWith("_usd_m")) {

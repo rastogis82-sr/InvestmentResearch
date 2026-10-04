@@ -1,0 +1,50 @@
+# Never include secrets in a Docker image -- API keys are injected as
+# environment variables at runtime (--env-file / docker-compose env_file),
+# never baked into the image. A leaked key in a pushed image has cost
+# companies millions.
+.env
+.env.*
+!.env.*.example
+
+# Python bytecode and cache -- regenerated at runtime
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Jupyter notebook files -- not needed in either container
+*.ipynb
+.ipynb_checkpoints/
+
+# Version control -- not needed in either container
+.git/
+.gitignore
+
+# Local virtual environment -- the container builds its own
+venv/
+.venv/
+
+# Diagrams, docs -- not runtime dependencies
+*.png
+*.md
+
+# investment_research_api.py and gradio_app.py are each fully
+# self-contained single files (see build_api_app.py) -- none of the
+# component/build/test files below are imported at runtime, so they're
+# excluded to keep the build context small. Harmless to include, but
+# unnecessary.
+assemble_notebook.py
+build_api_app.py
+build_diagram.py
+build_deployment_diagram.py
+graph_sim.py
+corpus.py
+guardrails.py
+local_retriever.py
+mock_llm.py
+node_logic.py
+real_market_data.py
+schemas.py
+test_harness.py
+test_real_market_data.py
+tools_mock.py

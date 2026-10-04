@@ -220,14 +220,28 @@ def _humanize_flag(flag: str) -> str:
     return flag.replace("_", " ").replace(":", " — ")
 
 
+# Small set of acronyms/abbreviations that Python's str.title() mangles
+# (e.g. "Ceo" instead of "CEO") -- applied after title-casing, not instead
+# of it, so "pe_ratio" still goes through the normal " "-join + title()
+# path and only the final token gets corrected.
+_KEY_LABEL_FIXUPS = {"Yoy": "YoY", "Ceo": "CEO", "Pe Ratio": "P/E Ratio", "Hq": "HQ"}
+
+
 def _humanize_key(key: str) -> str:
     base = key
-    for suffix in ("_usd_m", "_usd", "_pct"):
+    # Longer/more specific suffixes must be checked before shorter ones
+    # that could also match (e.g. "market_cap_usd_b" would otherwise never
+    # reach "_usd_b" if "_usd" were checked -- and matched -- first; in
+    # practice it isn't, since "_usd_b" doesn't end with "_usd", but the
+    # ordering is kept deliberate rather than relying on that).
+    for suffix in ("_usd_b", "_usd_m", "_usd", "_pct"):
         if base.endswith(suffix):
             base = base[: -len(suffix)]
             break
     label = base.replace("_", " ").strip().title()
-    return label.replace("Yoy", "YoY") or key
+    for wrong, right in _KEY_LABEL_FIXUPS.items():
+        label = label.replace(wrong, right)
+    return label or key
 
 
 def _humanize_tool(name: str) -> str:
@@ -246,6 +260,13 @@ def _format_value(key: str, value) -> str:
             # Always 2 decimal places -- a real TwelveData percent_change
             # (e.g. 0.922395) must not render as "+0.922395%".
             return f"{value:+.2f}%"
+        # market_cap_usd_b (from FCS API, see fcs_market_data.py) is
+        # already in BILLIONS -- auto-scale to trillions above 1000 rather
+        # than printing an unwieldy "$3,806.3B" for a company like Apple.
+        if key_l.endswith("_usd_b"):
+            if abs(value) >= 1000:
+                return f"${value / 1000:,.2f}T"
+            return f"${value:,.1f}B"
         # "usd" covers revenue_usd_m/last_price_usd; the _low/_high suffix
         # covers fifty_two_week_low/fifty_two_week_high, which are also
         # dollar prices but don't carry "usd" in the key name.

@@ -1,0 +1,31 @@
+# Investment Research Assistant -- API service image
+#
+# Same recipe pattern as the Week 16 notebook's ShopAssist Dockerfile
+# (Section 7): pin the exact Python version, install deps before copying
+# code so the pip-install layer is cached across rebuilds, copy only the
+# single self-contained app file, document the port, run uvicorn bound to
+# 0.0.0.0 (required for the port to be reachable from outside the
+# container).
+#
+# investment_research_api.py is a fully self-contained generated file
+# (see build_api_app.py) -- it has no sibling .py modules to copy in.
+# All configuration (OPENAI_API_KEY, LLM_PROVIDER, etc.) is injected at
+# *runtime* via --env-file / docker-compose's env_file, never baked into
+# this image -- see .dockerignore, which excludes .env on purpose.
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Copy requirements BEFORE application code so Docker can cache this
+# layer -- if requirements.txt hasn't changed, pip install is skipped on
+# the next build.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY investment_research_api.py .
+
+# Informational only -- does not actually open the port.
+EXPOSE 8000
+
+CMD ["uvicorn", "investment_research_api:app", "--host", "0.0.0.0", "--port", "8000"]

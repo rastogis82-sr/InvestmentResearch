@@ -15,6 +15,8 @@ services:
         value: "0.35"
       - key: TWELVEDATA_CACHE_TTL_SECONDS
         value: "30"
+      - key: FCS_CACHE_TTL_SECONDS
+        value: "30"
       # --- Secrets: sync: false means Render will prompt for these in the
       # dashboard and never store the value in this file or in git. Set
       # them once under the service's Environment tab after it's created. ---
@@ -26,3 +28,25 @@ services:
         sync: false                   # optional — e.g. a Vocareum proxy URL instead of api.openai.com (used for both embeddings and chat)
       - key: TWELVEDATA_API_KEY
         sync: false                   # optional — enables real-company (AAPL/MSFT/...) live data
+      - key: FCS_API_KEY
+        sync: false                   # optional — fills in profile/financials data Twelve Data's free plan can't provide; see merged_market_data.py
+
+  # --- Second service: the Gradio chat UI, deployed separately from the
+  # API above and talking to it only over HTTP (API_BASE_URL). This block
+  # documents the pattern for the "Blueprint" New+ flow; since the API
+  # service above was created via the manual "Web Service" flow (which
+  # doesn't auto-read this file), create this one the same manual way —
+  # see GRADIO_DEPLOY.md. ---
+  - type: web
+    name: investment-research-gradio
+    runtime: python
+    buildCommand: pip install -r requirements-gradio.txt
+    startCommand: python gradio_app.py
+    healthCheckPath: /
+    envVars:
+      - key: API_BASE_URL
+        value: "https://investmentresearch.onrender.com"   # the API service's own URL — not a secret, but still env-configurable, never hardcoded in gradio_app.py
+      - key: API_TIMEOUT_SECONDS
+        value: "60"
+      - key: GRADIO_SHARE
+        value: "false"

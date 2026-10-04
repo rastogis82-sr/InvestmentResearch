@@ -1,0 +1,24 @@
+# Investment Research Assistant -- Gradio frontend image
+#
+# Same pattern as Dockerfile.api, deliberately kept as a separate image
+# (separate Dockerfile, separate requirements file) so this service's
+# build stays small -- no LangChain/LangGraph/FAISS at all, just gradio +
+# requests + python-dotenv.
+#
+# gradio_app.py talks to the API over HTTP via API_BASE_URL, which is
+# injected at runtime (docker-compose sets it to http://api:8000 so the
+# two containers can reach each other by service name on the Compose
+# network -- see docker-compose.yml). Nothing is hardcoded here.
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements-gradio.txt .
+RUN pip install --no-cache-dir -r requirements-gradio.txt
+
+COPY gradio_app.py .
+
+EXPOSE 7860
+
+CMD ["python", "gradio_app.py"]
