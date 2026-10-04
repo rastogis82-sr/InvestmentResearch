@@ -41,6 +41,7 @@ Environment variables:
 import html
 import json
 import os
+import re
 import uuid
 
 import gradio as gr
@@ -127,6 +128,54 @@ def _new_session_id() -> str:
     return str(uuid.uuid4())
 
 
+# A research brief's first line is always "Research brief — <COMPANY>" (see
+# node_logic.py / investment_research_api.py's synthesize_brief_node) and
+# every section after it is "<Label>: item; item; item". Reformatting this
+# into Markdown is display-only: it happens here in the Gradio layer, never
+# touches the API's actual response string, so the test harness, the
+# notebook, and the raw /chat JSON all keep seeing the original plain text.
+_BRIEF_TITLE_RE = re.compile(r"^Research brief\s*[—-]\s*(.+)$")
+_BRIEF_SECTION_RE = re.compile(r"^([A-Za-z][A-Za-z /()]{2,40}):\s(.*)$")
+
+
+def _format_chat_response(text: str) -> str:
+    """Turns the brief's labeled, semicolon-joined lines into Markdown
+    (a heading plus a bulleted list per section) for gr.Chatbot, which
+    renders Markdown natively. Any response that isn't shaped like a brief
+    -- a guardrail's plain refusal, clarification request, or error message
+    -- doesn't match the title line and passes through completely
+    unchanged."""
+    if not text:
+        return text
+
+    lines = text.split("\n")
+    title_match = _BRIEF_TITLE_RE.match(lines[0].strip())
+    if not title_match:
+        return text
+
+    out = [f"### Research Brief — {title_match.group(1).strip()}"]
+    for line in lines[1:]:
+        line = line.strip()
+        if not line:
+            continue
+        sec_match = _BRIEF_SECTION_RE.match(line)
+        if not sec_match:
+            out.append(line)
+            continue
+        label, body = sec_match.group(1).strip(), sec_match.group(2).strip()
+        items = [i.strip() for i in body.split("; ") if i.strip()]
+        if len(items) > 1:
+            # A blank line MUST separate the header paragraph from the list
+            # that follows -- without it, Markdown treats "- item" lines as
+            # a continuation of the same paragraph (literal hyphens in
+            # running text) rather than as list items.
+            out.append(f"\n**{label}**\n")
+            out.extend(f"- {i}" for i in items)
+        else:
+            out.append(f"\n**{label}**\n{body}")
+    return "\n".join(out)
+
+
 def _flag_status(flag: str) -> str:
     """Maps a flag string's prefix to a status severity. Unknown flags
     default to 'warning' -- better to over-flag than silently drop a
@@ -142,12 +191,33 @@ def _flag_status(flag: str) -> str:
 
 def _badge(text: str, status: str) -> str:
     s = _STATUS_STYLE[status]
+    # white-space:normal + overflow-wrap (not nowrap) is deliberate: a flag
+    # or error string of unknown length must never force the panel to
+    # scroll horizontally. Worst case a long label wraps to a second line
+    # inside the pill -- still bounded, never overflowing.
     return (
-        f'<span style="display:inline-flex;align-items:center;gap:4px;'
+        f'<span style="display:inline-flex;align-items:center;gap:4px;max-width:100%;'
         f'background:{s["bg"]};border:1px solid {s["border"]};color:{s["fg"]};'
         f'border-radius:999px;padding:2px 10px;font-size:12px;font-weight:600;'
-        f'margin:2px 4px 2px 0;white-space:nowrap;">{s["icon"]} {html.escape(text)}</span>'
+        f'margin:2px 4px 2px 0;white-space:normal;overflow-wrap:break-word;">'
+        f'{s["icon"]} {html.escape(text)}</span>'
     )
+
+
+def _humanize_flag(flag: str) -> str:
+    """Turns a raw flag string (e.g. 'tool_failure:get_company_financials')
+    into a short human label for the badge -- the raw flag can be long
+    (an injection flag embeds the matched text via repr()) and a pill
+    badge should never carry a full sentence."""
+    if flag.startswith("tool_failure:"):
+        return f"Tool failed: {_humanize_tool(flag.split(':', 1)[1])}"
+    if flag.startswith("rag_failure"):
+        return "No matching document found"
+    if flag.startswith("conflicting_data"):
+        return "Conflicting data between sources"
+    if flag.startswith("injection"):
+        return "Prompt injection detected"
+    return flag.replace("_", " ").replace(":", " — ")
 
 
 def _humanize_key(key: str) -> str:
@@ -173,14 +243,19 @@ def _format_value(key: str, value) -> str:
     if isinstance(value, (int, float)):
         key_l = key.lower()
         if key_l.endswith("_pct"):
-            return f"{value:+g}%"
-        if "usd" in key_l:
+            # Always 2 decimal places -- a real TwelveData percent_change
+            # (e.g. 0.922395) must not render as "+0.922395%".
+            return f"{value:+.2f}%"
+        # "usd" covers revenue_usd_m/last_price_usd; the _low/_high suffix
+        # covers fifty_two_week_low/fifty_two_week_high, which are also
+        # dollar prices but don't carry "usd" in the key name.
+        if "usd" in key_l or key_l.endswith("_low") or key_l.endswith("_high"):
             if key_l.endswith("_usd_m"):
                 return f"${value:,.1f}M"
             return f"${value:,.2f}"
-        if key_l == "employees":
+        if float(value).is_integer():
             return f"{int(value):,}"
-        return f"{value:,.2f}" if isinstance(value, float) else f"{value:,}"
+        return f"{value:,.2f}"
     return str(value)
 
 
@@ -198,7 +273,7 @@ def _build_summary_html(result: dict, debug_state: dict) -> str:
     parts = [
         '<div style="font-family:system-ui,-apple-system,\'Segoe UI\',sans-serif;'
         f'background:{_SURFACE};border:1px solid {_GRID};border-radius:10px;'
-        f'padding:14px 16px;color:{_INK};">'
+        f'padding:14px 16px;color:{_INK};overflow-wrap:break-word;word-break:break-word;">'
     ]
 
     header_bits = []
@@ -225,7 +300,7 @@ def _build_summary_html(result: dict, debug_state: dict) -> str:
     )
     parts.append('<div style="margin-bottom:12px;">')
     if flags:
-        parts.append("".join(_badge(f, _flag_status(f)) for f in flags))
+        parts.append("".join(_badge(_humanize_flag(f), _flag_status(f)) for f in flags))
     else:
         parts.append(_badge("No issues flagged", "good"))
     parts.append("</div>")
@@ -237,13 +312,23 @@ def _build_summary_html(result: dict, debug_state: dict) -> str:
         )
         for tool_name, tr in tool_results.items():
             ok = bool(tr.get("ok"))
-            status_badge = _badge("ok", "good") if ok else _badge(str(tr.get("error", "failed")), "serious")
+            # The status badge is always a short fixed label ("ok"/"failed")
+            # -- the actual error can be a full sentence (e.g. TwelveData's
+            # "plan_restricted:/profile is available exclusively with
+            # growth plans and above"), which must never go inside a pill;
+            # it's rendered as its own wrapped line below instead.
+            status_badge = _badge("ok", "good") if ok else _badge("failed", "serious")
             parts.append(
                 f'<div style="border:1px solid {_GRID};border-radius:8px;padding:8px 10px;margin-bottom:6px;">'
                 '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">'
                 f'<span style="font-weight:600;font-size:13px;">{html.escape(_humanize_tool(tool_name))}</span>'
                 f"{status_badge}</div>"
             )
+            if not ok:
+                error_text = str(tr.get("error", "Unknown error"))
+                parts.append(
+                    f'<div style="font-size:12px;color:#7a3b1f;margin-top:6px;">{html.escape(error_text)}</div>'
+                )
             data = tr.get("data") if ok else None
             if isinstance(data, dict) and data:
                 rows = []
@@ -350,7 +435,7 @@ def _build_metrics_plot(debug_state: dict):
 def _on_submit(message: str, history: list, session_id: str):
     result = _call_chat(session_id, message)
     if result.get("ok"):
-        response_text = result.get("response", "")
+        response_text = _format_chat_response(result.get("response", ""))
     else:
         response_text = f"⚠️ {result.get('error', 'Unknown error.')}"
 
