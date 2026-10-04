@@ -17,11 +17,18 @@ ephemeral free-tier ngrok URL, no auth on the debug endpoint).
 
 Configuration (environment variables, all optional with sane defaults):
     MOCK_LLM            "true"/"false" (default "false") — offline heuristic
-                        LLM stand-in, no API key needed, for free smoke tests.
+                        LLM stand-in AND a dependency-free keyword-overlap
+                        retriever (skips embeddings/FAISS entirely), no API
+                        key or network call needed, for free smoke tests.
     LLM_PROVIDER        e.g. "openai:gpt-4o-mini" (default) or
-                        "anthropic:claude-3-5-haiku-latest". Only used when
-                        MOCK_LLM is false, and only then does an API key
-                        (OPENAI_API_KEY / ANTHROPIC_API_KEY) need to be set.
+                        "anthropic:claude-3-5-haiku-latest" — only used
+                        when MOCK_LLM is false, for the CHAT model. RAG
+                        embeddings always use OpenAI's API regardless of
+                        this setting (Anthropic has no public embeddings
+                        endpoint), so OPENAI_API_KEY is required whenever
+                        MOCK_LLM is false, even with an Anthropic chat
+                        model — ANTHROPIC_API_KEY is only needed in
+                        addition, for the chat calls themselves.
     IRA_SCORE_THRESHOLD RAG similarity threshold (default 0.35).
     IRA_CORPUS_DIR      Where the synthetic knowledge base is written
                         (default /tmp/investment_research_kb).
@@ -999,84 +1006,9 @@ def write_corpus_to_disk(target_dir: str):
 
 
 # =============================================================================
-# Vector store (FAISS + free local HuggingFace embeddings — no API key
-# needed for RAG regardless of which chat LLM is configured below).
-# =============================================================================
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
-
-CORPUS_DIR = os.environ.get("IRA_CORPUS_DIR", "/tmp/investment_research_kb")
-write_corpus_to_disk(CORPUS_DIR)
-
-
-@dataclass
-class RetrievedChunk:
-    text: str
-    source: str
-    company: Optional[str]
-    score: float
-
-
-def _load_documents_as_langchain_docs():
-    docs = []
-    for meta in DOCUMENTS:
-        docs.append(Document(
-            page_content=meta["text"],
-            metadata={"source": meta["filename"], "company": meta["company"], "doc_type": meta["doc_type"]},
-        ))
-    return docs
-
-
-logger.info("Building vector store...")
-_embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=80)
-_chunked_docs = _splitter.split_documents(_load_documents_as_langchain_docs())
-_vectorstore = FAISS.from_documents(_chunked_docs, _embeddings)
-
-SCORE_THRESHOLD = float(os.environ.get("IRA_SCORE_THRESHOLD", "0.35"))
-
-
-class FAISSRetriever:
-    """Same `.retrieve(query, company_filter, k)` interface used throughout
-    — filters by company in Python rather than relying on a specific
-    LangChain version's native FAISS metadata-filter argument.
-    """
-
-    def __init__(self, vectorstore: FAISS, score_threshold: float):
-        self.vectorstore = vectorstore
-        self.score_threshold = score_threshold
-
-    def retrieve(self, query: str, company_filter: Optional[str] = None, k: int = 4) -> List[RetrievedChunk]:
-        raw_hits = self.vectorstore.similarity_search_with_score(query, k=max(k * 4, 12))
-        out = []
-        for doc, distance in raw_hits:
-            doc_company = doc.metadata.get("company")
-            if company_filter and doc_company not in (company_filter, None):
-                continue
-            # Cast to a plain Python float: FAISS returns `distance` as
-            # numpy.float32, which otherwise flows into retrieved_docs and
-            # breaks LangGraph's msgpack-based checkpoint serializer
-            # (`TypeError: Type is not msgpack serializable: numpy.float32`).
-            similarity = float(1.0 / (1.0 + distance))
-            if similarity < self.score_threshold:
-                continue
-            out.append(RetrievedChunk(
-                text=doc.page_content,
-                source=doc.metadata.get("source", "unknown"),
-                company=doc_company,
-                score=similarity,
-            ))
-        out.sort(key=lambda c: c.score, reverse=True)
-        return out[:k]
-
-
-retriever = FAISSRetriever(_vectorstore, SCORE_THRESHOLD)
-logger.info("Vector store ready", extra={"chunks": len(_chunked_docs)})
-
-# =============================================================================
-# LLM — MOCK_LLM / LLM_PROVIDER env vars, same toggle as the notebook.
+# MOCK_LLM / LLM_PROVIDER env vars — read early (before the vector store
+# section below) because retrieval strategy now depends on MOCK_LLM too,
+# not just which chat LLM gets used.
 # =============================================================================
 """
 mock_llm.py
@@ -1258,18 +1190,147 @@ class MockChatModel:
 
 MOCK_LLM = os.environ.get("MOCK_LLM", "false").strip().lower() == "true"
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "openai:gpt-4o-mini")
+# Optional custom OpenAI-compatible endpoint — e.g. a Vocareum proxy URL
+# instead of api.openai.com, for courses that issue Vocareum-hosted keys
+# rather than a personal OpenAI key. Used below by BOTH the embeddings
+# client and the chat LLM client.
+_openai_base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
 
+# =============================================================================
+# Vector store.
+#
+# Embeddings: OpenAI's API (`text-embedding-3-small`), not a local
+# HuggingFace/sentence-transformers model. This was a deliberate change —
+# the original design used a free local model specifically so RAG needed
+# no API key. In practice, loading sentence-transformers pulls in
+# `torch`+`transformers` (plus, on a default pip install, a full set of
+# unused CUDA packages), which alone exceeds Render's free-tier 512MB RAM
+# cap at the "build the vector store" step (see architecture.md's
+# Troubleshooting section for the exact OOM this caused). OpenAI embeddings
+# trade "needs an API key + network" for "needs ~0 extra RAM and ~0 extra
+# install size" — worth it for a service meant to run on a memory-capped
+# host. This does mean OPENAI_API_KEY (and OPENAI_BASE_URL, if you're on a
+# Vocareum-style proxy) is now required even if LLM_PROVIDER is set to an
+# Anthropic model — Anthropic has no public embeddings endpoint, so RAG
+# always calls OpenAI's regardless of which model answers the chat turn.
+#
+# MOCK_LLM=True skips this branch entirely and uses a dependency-free
+# keyword-overlap retriever instead (same one test_harness.py's local
+# simulation uses) — zero network calls, zero API key, for a genuinely
+# free/offline smoke test of the graph's control flow.
+# =============================================================================
+from langchain_community.vectorstores import FAISS
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
+
+CORPUS_DIR = os.environ.get("IRA_CORPUS_DIR", "/tmp/investment_research_kb")
+write_corpus_to_disk(CORPUS_DIR)
+
+
+@dataclass
+class RetrievedChunk:
+    text: str
+    source: str
+    company: Optional[str]
+    score: float
+
+
+def _load_documents_as_langchain_docs():
+    docs = []
+    for meta in DOCUMENTS:
+        docs.append(Document(
+            page_content=meta["text"],
+            metadata={"source": meta["filename"], "company": meta["company"], "doc_type": meta["doc_type"]},
+        ))
+    return docs
+
+
+class _LocalKeywordRetriever:
+    """Dependency-free stand-in used only when MOCK_LLM=True — scores by
+    keyword overlap instead of vector similarity. Same
+    `.retrieve(query, company_filter, k)` interface as `FAISSRetriever`
+    below, so `rag_node` doesn't need to know which one it's calling."""
+
+    def __init__(self, score_threshold: float = 0.12):
+        self.score_threshold = score_threshold
+        self.documents = DOCUMENTS
+
+    def retrieve(self, query: str, company_filter: Optional[str] = None, k: int = 4) -> List[RetrievedChunk]:
+        q_words = set(w.lower() for w in query.split() if len(w) > 2)
+        out = []
+        for doc in self.documents:
+            if company_filter and doc["company"] not in (company_filter, None):
+                continue
+            d_words = set(w.lower().strip(".,:;()") for w in doc["text"].split() if len(w) > 2)
+            score = (len(q_words & d_words) / len(q_words)) if q_words else 0.0
+            if score >= self.score_threshold:
+                out.append(RetrievedChunk(text=doc["text"], source=doc["filename"], company=doc["company"], score=score))
+        out.sort(key=lambda c: c.score, reverse=True)
+        return out[:k]
+
+
+class FAISSRetriever:
+    """Same `.retrieve(query, company_filter, k)` interface used throughout
+    — filters by company in Python rather than relying on a specific
+    LangChain version's native FAISS metadata-filter argument.
+    """
+
+    def __init__(self, vectorstore: FAISS, score_threshold: float):
+        self.vectorstore = vectorstore
+        self.score_threshold = score_threshold
+
+    def retrieve(self, query: str, company_filter: Optional[str] = None, k: int = 4) -> List[RetrievedChunk]:
+        raw_hits = self.vectorstore.similarity_search_with_score(query, k=max(k * 4, 12))
+        out = []
+        for doc, distance in raw_hits:
+            doc_company = doc.metadata.get("company")
+            if company_filter and doc_company not in (company_filter, None):
+                continue
+            # Cast to a plain Python float: FAISS returns `distance` as
+            # numpy.float32, which otherwise flows into retrieved_docs and
+            # breaks LangGraph's msgpack-based checkpoint serializer
+            # (`TypeError: Type is not msgpack serializable: numpy.float32`).
+            similarity = float(1.0 / (1.0 + distance))
+            if similarity < self.score_threshold:
+                continue
+            out.append(RetrievedChunk(
+                text=doc.page_content,
+                source=doc.metadata.get("source", "unknown"),
+                company=doc_company,
+                score=similarity,
+            ))
+        out.sort(key=lambda c: c.score, reverse=True)
+        return out[:k]
+
+
+if MOCK_LLM:
+    retriever = _LocalKeywordRetriever()
+    logger.info("Retrieval mode: MOCK (keyword-overlap, no embeddings/FAISS — offline, zero API key)")
+else:
+    logger.info("Building vector store (OpenAI embeddings)...")
+    from langchain_openai import OpenAIEmbeddings
+
+    _embedding_kwargs = {}
+    if _openai_base_url:
+        _embedding_kwargs["base_url"] = _openai_base_url
+    _embeddings = OpenAIEmbeddings(model="text-embedding-3-small", **_embedding_kwargs)
+    _splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=80)
+    _chunked_docs = _splitter.split_documents(_load_documents_as_langchain_docs())
+    _vectorstore = FAISS.from_documents(_chunked_docs, _embeddings)
+
+    SCORE_THRESHOLD = float(os.environ.get("IRA_SCORE_THRESHOLD", "0.35"))
+    retriever = FAISSRetriever(_vectorstore, SCORE_THRESHOLD)
+    logger.info("Vector store ready", extra={"chunks": len(_chunked_docs)})
+
+# =============================================================================
+# Chat LLM.
+# =============================================================================
 if MOCK_LLM:
     llm = MockChatModel()
     logger.info("LLM mode: MOCK (offline wiring test, no API key used)")
 else:
     from langchain.chat_models import init_chat_model
 
-    # Optional custom OpenAI-compatible endpoint — e.g. a Vocareum proxy URL
-    # instead of api.openai.com, for courses that issue Vocareum-hosted keys
-    # rather than a personal OpenAI key. Only applied for openai-family
-    # providers, and only when actually set via .env / the environment.
-    _openai_base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
     _llm_kwargs = {}
     if _openai_base_url and LLM_PROVIDER.startswith("openai"):
         _llm_kwargs["base_url"] = _openai_base_url

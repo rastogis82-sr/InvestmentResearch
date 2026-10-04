@@ -19,10 +19,10 @@ services:
       # dashboard and never store the value in this file or in git. Set
       # them once under the service's Environment tab after it's created. ---
       - key: OPENAI_API_KEY
-        sync: false                   # required unless LLM_PROVIDER uses anthropic
+        sync: false                   # ALWAYS required — RAG embeddings call OpenAI's API regardless of LLM_PROVIDER
       - key: ANTHROPIC_API_KEY
-        sync: false                   # only needed if LLM_PROVIDER starts with "anthropic:"
+        sync: false                   # only needed IN ADDITION, if LLM_PROVIDER starts with "anthropic:" (for chat calls)
       - key: OPENAI_BASE_URL
-        sync: false                   # optional — e.g. a Vocareum proxy URL instead of api.openai.com
+        sync: false                   # optional — e.g. a Vocareum proxy URL instead of api.openai.com (used for both embeddings and chat)
       - key: TWELVEDATA_API_KEY
         sync: false                   # optional — enables real-company (AAPL/MSFT/...) live data
