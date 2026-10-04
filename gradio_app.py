@@ -38,15 +38,34 @@ Environment variables:
                            not localhost, to be reachable.
 """
 
+import html
 import json
 import os
 import uuid
 
 import gradio as gr
+import matplotlib
+
+matplotlib.use("Agg")  # headless -- no display available on a server
+import matplotlib.pyplot as plt
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()  # no-op if no .env file exists; never overrides a real env var
+
+# --- Color palette for the transparency panel -------------------------
+# Status colors (fixed, never themed) and chart chrome from the project's
+# standard data-viz palette. Every status badge pairs an icon with the
+# label text, never color alone, per that palette's accessibility rule.
+_STATUS_STYLE = {
+    "critical": {"bg": "#fbe2e2", "border": "#d03b3b", "fg": "#7a1f1f", "icon": "✕"},
+    "serious":  {"bg": "#fbe9e2", "border": "#ec835a", "fg": "#7a3b1f", "icon": "⚠"},
+    "warning":  {"bg": "#fdf1d6", "border": "#fab219", "fg": "#6b4e05", "icon": "⚠"},
+    "good":     {"bg": "#e3f6e3", "border": "#0ca30c", "fg": "#0a4d0a", "icon": "✓"},
+    "info":     {"bg": "#e8eef8", "border": "#2a78d6", "fg": "#1c4a80", "icon": "ℹ"},
+}
+_SURFACE, _GRID, _MUTED, _INK = "#fcfcfb", "#e1e0d9", "#898781", "#0b0b0b"
+_SEQ_BLUE, _DIVERGE_RED = "#2a78d6", "#e34948"  # the palette's diverging pair
 
 API_BASE_URL = os.environ.get("API_BASE_URL", "").strip().rstrip("/")
 API_TIMEOUT_SECONDS = float(os.environ.get("API_TIMEOUT_SECONDS", "60"))
@@ -108,6 +127,226 @@ def _new_session_id() -> str:
     return str(uuid.uuid4())
 
 
+def _flag_status(flag: str) -> str:
+    """Maps a flag string's prefix to a status severity. Unknown flags
+    default to 'warning' -- better to over-flag than silently drop a
+    guardrail hit the UI doesn't recognize yet."""
+    if flag.startswith("injection"):
+        return "critical"
+    if flag.startswith("tool_failure"):
+        return "serious"
+    if flag.startswith("rag_failure") or flag.startswith("conflicting_data"):
+        return "warning"
+    return "warning"
+
+
+def _badge(text: str, status: str) -> str:
+    s = _STATUS_STYLE[status]
+    return (
+        f'<span style="display:inline-flex;align-items:center;gap:4px;'
+        f'background:{s["bg"]};border:1px solid {s["border"]};color:{s["fg"]};'
+        f'border-radius:999px;padding:2px 10px;font-size:12px;font-weight:600;'
+        f'margin:2px 4px 2px 0;white-space:nowrap;">{s["icon"]} {html.escape(text)}</span>'
+    )
+
+
+def _humanize_key(key: str) -> str:
+    base = key
+    for suffix in ("_usd_m", "_usd", "_pct"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    label = base.replace("_", " ").strip().title()
+    return label.replace("Yoy", "YoY") or key
+
+
+def _humanize_tool(name: str) -> str:
+    label = name[4:] if name.startswith("get_") else name
+    return label.replace("_", " ").strip().title() or name
+
+
+def _format_value(key: str, value) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if isinstance(value, (int, float)):
+        key_l = key.lower()
+        if key_l.endswith("_pct"):
+            return f"{value:+g}%"
+        if "usd" in key_l:
+            if key_l.endswith("_usd_m"):
+                return f"${value:,.1f}M"
+            return f"${value:,.2f}"
+        if key_l == "employees":
+            return f"{int(value):,}"
+        return f"{value:,.2f}" if isinstance(value, float) else f"{value:,}"
+    return str(value)
+
+
+def _build_summary_html(result: dict, debug_state: dict) -> str:
+    """Renders the transparency panel as styled HTML: colored flag badges,
+    a tool-call card per tool with its fields formatted, and retrieved-doc
+    chips -- instead of a raw JSON dump. Never raises: any missing/odd
+    field just gets skipped rather than crashing the UI."""
+    flags = result.get("flags") or debug_state.get("flags") or []
+    resolved_company = debug_state.get("resolved_company")
+    latency_ms = result.get("latency_ms")
+    tool_results = debug_state.get("tool_results") or {}
+    retrieved_docs = debug_state.get("retrieved_docs") or []
+
+    parts = [
+        '<div style="font-family:system-ui,-apple-system,\'Segoe UI\',sans-serif;'
+        f'background:{_SURFACE};border:1px solid {_GRID};border-radius:10px;'
+        f'padding:14px 16px;color:{_INK};">'
+    ]
+
+    header_bits = []
+    if resolved_company:
+        header_bits.append(
+            '<span style="display:inline-block;background:#e8eef8;border:1px solid #2a78d6;'
+            f'color:#1c4a80;border-radius:6px;padding:2px 8px;font-weight:700;font-size:13px;">'
+            f'{html.escape(str(resolved_company))}</span>'
+        )
+    if latency_ms is not None:
+        header_bits.append(
+            f'<span style="color:{_MUTED};font-size:12px;">{latency_ms / 1000:.1f}s response time</span>'
+        )
+    if header_bits:
+        parts.append(
+            '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">'
+            + "".join(header_bits)
+            + "</div>"
+        )
+
+    parts.append(
+        f'<div style="font-size:11px;text-transform:uppercase;letter-spacing:0.04em;'
+        f'color:{_MUTED};margin-bottom:4px;">Guardrail flags</div>'
+    )
+    parts.append('<div style="margin-bottom:12px;">')
+    if flags:
+        parts.append("".join(_badge(f, _flag_status(f)) for f in flags))
+    else:
+        parts.append(_badge("No issues flagged", "good"))
+    parts.append("</div>")
+
+    if tool_results:
+        parts.append(
+            f'<div style="font-size:11px;text-transform:uppercase;letter-spacing:0.04em;'
+            f'color:{_MUTED};margin-bottom:4px;">Tool calls</div>'
+        )
+        for tool_name, tr in tool_results.items():
+            ok = bool(tr.get("ok"))
+            status_badge = _badge("ok", "good") if ok else _badge(str(tr.get("error", "failed")), "serious")
+            parts.append(
+                f'<div style="border:1px solid {_GRID};border-radius:8px;padding:8px 10px;margin-bottom:6px;">'
+                '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">'
+                f'<span style="font-weight:600;font-size:13px;">{html.escape(_humanize_tool(tool_name))}</span>'
+                f"{status_badge}</div>"
+            )
+            data = tr.get("data") if ok else None
+            if isinstance(data, dict) and data:
+                rows = []
+                for k, v in data.items():
+                    if k in ("source", "note"):
+                        continue
+                    rows.append(
+                        '<div style="display:flex;justify-content:space-between;font-size:12px;'
+                        f'padding:2px 0;color:{_MUTED};">'
+                        f"<span>{html.escape(_humanize_key(k))}</span>"
+                        f'<span style="font-variant-numeric:tabular-nums;color:{_INK};font-weight:500;">'
+                        f"{html.escape(_format_value(k, v))}</span></div>"
+                    )
+                if rows:
+                    parts.append(f'<div style="margin-top:6px;">{"".join(rows)}</div>')
+                note = data.get("note")
+                if note:
+                    parts.append(
+                        f'<div style="font-size:11px;color:{_MUTED};margin-top:4px;font-style:italic;">'
+                        f"{html.escape(str(note))}</div>"
+                    )
+            parts.append("</div>")
+
+    if retrieved_docs:
+        parts.append(
+            f'<div style="font-size:11px;text-transform:uppercase;letter-spacing:0.04em;'
+            f'color:{_MUTED};margin:10px 0 4px;">Retrieved sources</div><div>'
+        )
+        for d in retrieved_docs:
+            src = d.get("source") if isinstance(d, dict) else str(d)
+            parts.append(
+                '<span style="display:inline-block;background:#f0efec;border:1px solid #c3c2b7;'
+                f'color:{_MUTED};border-radius:6px;padding:2px 8px;font-size:11px;margin:2px 4px 2px 0;">'
+                f"{html.escape(str(src))}</span>"
+            )
+        parts.append("</div>")
+
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def _build_metrics_plot(debug_state: dict):
+    """Builds a horizontal bar chart of every *_pct field returned by any
+    successful tool call this turn (revenue growth, margins, day change,
+    etc. -- works unchanged for synthetic ABC/XYZ/DEF and real-company
+    data since both share the same _pct-suffixed field convention). Blue
+    for positive, red for negative -- the palette's diverging pair, which
+    fits naturally since these are gain/loss values straddling zero.
+    Returns None (clearing the plot) when there's nothing numeric to show,
+    e.g. a RAG-failure or tool-failure turn."""
+    tool_results = debug_state.get("tool_results") or {}
+    metrics = {}
+    for tr in tool_results.values():
+        if not tr.get("ok"):
+            continue
+        data = tr.get("data")
+        if not isinstance(data, dict):
+            continue
+        for k, v in data.items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and k.lower().endswith("_pct"):
+                metrics.setdefault(_humanize_key(k), float(v))
+
+    if not metrics:
+        return None
+
+    labels = list(metrics.keys())[:8]
+    values = [metrics[l] for l in labels]
+
+    fig, ax = plt.subplots(figsize=(5, max(2.2, 0.45 * len(labels) + 0.8)))
+    fig.patch.set_facecolor(_SURFACE)
+    ax.set_facecolor(_SURFACE)
+
+    y_pos = range(len(labels))
+    ax.barh(y_pos, values, color=[_SEQ_BLUE if v >= 0 else _DIVERGE_RED for v in values], height=0.55, zorder=3)
+    ax.set_yticks(list(y_pos))
+    ax.set_yticklabels(labels, fontsize=9, color=_INK)
+    ax.invert_yaxis()
+    ax.axvline(0, color=_MUTED, linewidth=0.8, zorder=2)
+    ax.set_xlabel("Percent (%)", fontsize=9, color=_MUTED)
+    ax.tick_params(axis="x", labelsize=8, colors=_MUTED)
+    ax.tick_params(axis="y", length=0)
+    for spine in ("top", "right", "left"):
+        ax.spines[spine].set_visible(False)
+    ax.spines["bottom"].set_color(_GRID)
+    ax.grid(axis="x", color=_GRID, linewidth=0.7, zorder=1)
+    ax.set_title("Key percentage metrics", fontsize=10, color=_INK, loc="left", fontweight="bold")
+
+    # Pad the axis so value labels never clip off the edge, including the
+    # single-bar case (e.g. only a "day change" value) where the data span
+    # alone would be too small to leave room for the label.
+    vmax, vmin = max(values), min(values)
+    span = max(vmax - vmin, 1.0)
+    offset, pad = span * 0.04, span * 0.18
+    ax.set_xlim(min(0, vmin) - pad, max(0, vmax) + pad)
+    for i, v in enumerate(values):
+        ax.text(
+            v + (offset if v >= 0 else -offset), i, f"{v:+.1f}%",
+            va="center", ha="left" if v >= 0 else "right", fontsize=8, color=_INK,
+        )
+    fig.tight_layout()
+    return fig
+
+
 def _on_submit(message: str, history: list, session_id: str):
     result = _call_chat(session_id, message)
     if result.get("ok"):
@@ -127,6 +366,11 @@ def _on_submit(message: str, history: list, session_id: str):
     ]
 
     debug_state = _call_debug(session_id)
+    summary_html = _build_summary_html(result, debug_state)
+    metrics_plot = _build_metrics_plot(debug_state)
+
+    # Raw JSON stays available too (collapsed, under "Raw debug JSON") for
+    # anyone who wants the exact payload rather than the formatted summary.
     transparency = {
         "flags": result.get("flags", debug_state.get("flags", [])),
         "latency_ms": result.get("latency_ms"),
@@ -134,11 +378,12 @@ def _on_submit(message: str, history: list, session_id: str):
         "tool_results": debug_state.get("tool_results", {}),
         "retrieved_docs": [d.get("source") for d in debug_state.get("retrieved_docs", [])],
     }
-    return history, "", json.dumps(transparency, indent=2, default=str), session_id
+    raw_json = json.dumps(transparency, indent=2, default=str)
+    return history, "", summary_html, metrics_plot, raw_json, session_id
 
 
 def _on_new_session():
-    return [], "", "", _new_session_id()
+    return [], "", "", None, "", _new_session_id()
 
 
 def _on_load():
@@ -165,21 +410,24 @@ with gr.Blocks(title="Investment Research Assistant") as demo:
             new_session_btn = gr.Button("New session")
         with gr.Column(scale=1):
             gr.Markdown("### Transparency panel")
-            transparency_box = gr.Code(
-                label="flags / resolved_company / tool_results / retrieved_docs",
-                language="json",
-            )
+            summary_html = gr.HTML()
+            metrics_plot = gr.Plot(label=None, show_label=False)
+            with gr.Accordion("Raw debug JSON", open=False):
+                transparency_box = gr.Code(
+                    label="flags / resolved_company / tool_results / retrieved_docs",
+                    language="json",
+                )
 
     demo.load(_on_load, outputs=[session_state])
 
     msg.submit(
         _on_submit,
         [msg, chatbot, session_state],
-        [chatbot, msg, transparency_box, session_state],
+        [chatbot, msg, summary_html, metrics_plot, transparency_box, session_state],
     )
     new_session_btn.click(
         _on_new_session,
-        outputs=[chatbot, msg, transparency_box, session_state],
+        outputs=[chatbot, msg, summary_html, metrics_plot, transparency_box, session_state],
     )
 
 if __name__ == "__main__":
