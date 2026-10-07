@@ -23,7 +23,7 @@ import json
 import re
 import base64
 
-LOCAL_MODULES = ["guardrails", "schemas", "tools_mock", "corpus", "node_logic", "mock_llm", "local_retriever", "real_market_data", "alpha_vantage_market_data", "merged_market_data"]
+LOCAL_MODULES = ["guardrails", "schemas", "tools_mock", "corpus", "node_logic", "mock_llm", "local_retriever", "real_market_data", "yahoo_finance_market_data", "merged_market_data"]
 
 
 def load_and_clean(path: str) -> str:
@@ -177,13 +177,11 @@ Field reference:
   placeholder to skip it; real-company questions then just get a clean
   "missing API key" tool failure instead of live data, and ABC/XYZ/DEF
   are completely unaffected either way.
-- `ALPHA_VANTAGE_API_KEY` — optional, independent of `TWELVEDATA_API_KEY`
-  above. Fills in company profile and real financial-statement data
-  (revenue, margins, YoY growth) that Twelve Data's free plan can't
-  provide at all — see Sections 1c/1d. Free signup, no credit card:
-  https://www.alphavantage.co/support/#api-key (free tier: 25
-  requests/day). Leave the placeholder to skip it; real companies then
-  just use whatever Twelve Data alone returned.
+- Yahoo Finance (via the `yfinance` package, Sections 1c/1d) needs **no
+  API key at all** — nothing to set for it here. It fills in company
+  profile and real financial-statement data (revenue, margins, YoY
+  growth) that Twelve Data's free plan can't provide at all, regardless
+  of whether `TWELVEDATA_API_KEY` above is set.
 
 > **Security note:** `.env` is written to the ephemeral Colab VM's local
 > disk only (not your Google Drive) and disappears when the runtime
@@ -198,8 +196,7 @@ LANGSMITH_PROJECT=investment-research-assistant
 LANGCHAIN_TRACING_V2=true
 NGROK_AUTH_TOKEN=your_ngrok_token_here
 NGROK_DOMAIN=your_ngrok_domain_here
-TWELVEDATA_API_KEY=your_twelvedata_api_key_here
-ALPHA_VANTAGE_API_KEY=your_alpha_vantage_api_key_here'''))
+TWELVEDATA_API_KEY=your_twelvedata_api_key_here'''))
 
 cells.append(code('''import os
 from getpass import getpass
@@ -278,24 +275,16 @@ else:
 # anything else in this notebook. No validation call here (unlike
 # LangSmith above): a bad/missing key just makes individual real-company
 # tool calls fail cleanly later, which the agent already knows how to
-# report honestly rather than crash on. The two providers are independent
-# of each other -- set either, both, or neither; see Section 1c for why
-# having both gives the most complete data.
+# report honestly rather than crash on. Yahoo Finance (Section 1c) needs
+# no key at all and is therefore always "enabled" -- Twelve Data is the
+# only one of the two providers that's actually optional here.
 if _is_placeholder(os.environ.get("TWELVEDATA_API_KEY", "")):
     os.environ.pop("TWELVEDATA_API_KEY", None)
     print("Real-company market data (Twelve Data): disabled (no TWELVEDATA_API_KEY in .env)")
+    print("-> Yahoo Finance (Section 1c) still provides live profile/financials; no key needed.")
 else:
     print("Real-company market data (Twelve Data): enabled")
-
-if _is_placeholder(os.environ.get("ALPHA_VANTAGE_API_KEY", "")):
-    os.environ.pop("ALPHA_VANTAGE_API_KEY", None)
-    print("Real-company market data (Alpha Vantage): disabled (no ALPHA_VANTAGE_API_KEY in .env)")
-else:
-    print("Real-company market data (Alpha Vantage): enabled")
-
-if not os.environ.get("TWELVEDATA_API_KEY") and not os.environ.get("ALPHA_VANTAGE_API_KEY"):
-    print("-> Neither market-data provider configured: ABC/XYZ/DEF are unaffected; "
-          "real-company questions will get a clean tool failure.")
+print("Real-company market data (Yahoo Finance, via yfinance): always enabled, no API key needed.")
 
 print(f"MOCK_LLM={MOCK_LLM}  LLM_PROVIDER={LLM_PROVIDER}  "
       f"custom_openai_base_url={bool(os.environ.get('OPENAI_BASE_URL'))}")'''))
@@ -345,12 +334,13 @@ https://twelvedata.com/pricing and set `TWELVEDATA_API_KEY` in Section
 the Section 4 corpus, so they'll always show `rag_failure` too — the same
 honest-failure pattern as the DEF Industries fixture, for the same
 reason (no fabricated documents, ever). **Section 1c adds a second
-provider that closes this specific gap** — the functions actually wired
-into `tools_node` (Section 7) are the merged ones from Section 1d, not
-these Twelve Data functions directly.'''))
+provider (Yahoo Finance, no API key needed) that closes this specific
+gap** — the functions actually wired into `tools_node` (Section 7) are
+the merged ones from Section 1d, not these Twelve Data functions
+directly.'''))
 cells.append(code(load_and_clean("real_market_data.py")))
 
-cells.append(md('''## 1c. Real-company market data, provider 2 (optional — Alpha Vantage)
+cells.append(md('''## 1c. Real-company market data, provider 2 (Yahoo Finance)
 
 Section 1b's honest limitation is a real gap, not a one-off: Twelve
 Data's free plan can serve live price but nothing else for a real
@@ -359,64 +349,70 @@ any tier used here, so `get_company_financials` never returns an actual
 revenue or margin figure even when it technically "succeeds" (it just
 reuses `/profile`'s company-level fields and says so).
 
-[Alpha Vantage](https://www.alphavantage.co/documentation/) (free
-signup, no credit card) closes exactly that gap: its `OVERVIEW` function
-returns company profile fields (sector, industry, address, website) AND
-trailing-twelve-month financial fields (revenue, gross/operating/net
-margin, EBITDA, P/E ratio, year-over-year revenue growth) in a **single**
-call — deliberately cached and shared between the profile and financials
-functions below, since Alpha Vantage's free tier is capped at 25
-requests/**day**, and one call covering both halves the quota spent per
-company looked up.
+**Yahoo Finance**, accessed via the widely-used
+[`yfinance`](https://github.com/ranaroussi/yfinance) package rather than
+hand-rolled HTTP calls, closes exactly that gap: a single
+`Ticker(ticker).info` call returns company profile fields (sector,
+industry, address, employee count, website) AND financial fields
+(revenue, gross/operating/net margin, EBITDA, P/E ratio, year-over-year
+revenue growth) together — deliberately cached and shared between price,
+profile, and financials below, so one real company looked up for all
+three things in a turn costs exactly one underlying Yahoo request. No API
+key, no signup, no published rate limit at all.
 
-*(An earlier version of this notebook used FCS API as provider 2. A live
-test against a real FCS API free-tier key showed it rejects every stock
-endpoint on the free plan, contradicting its own documentation — see
-`merged_market_data.py`'s module docstring for the full story. Alpha
-Vantage has no such endpoint-level gating on its free tier.)*
+*(This notebook has used two earlier secondary providers before this one,
+each dropped for a concrete reason: FCS API's free plan turned out to
+reject every stock endpoint despite its documentation not saying so, and
+Alpha Vantage worked but was capped at a tight 25 requests/day. See
+`merged_market_data.py`'s module docstring for the full history. The
+trade-off with Yahoo Finance runs the other way: no key and no published
+cap, but also no official, documented, supported API — `yfinance` calls
+the same internal endpoints Yahoo's own website uses, which Yahoo can
+change or block without notice. See `yahoo_finance_market_data.py`'s
+module docstring for the full honest discussion.)*
 
 This cell, on its own, is just a second single-provider module with the
 exact same `{"ok": True/False, ...}` contract as Section 1b's
 `real_market_data.py` — it doesn't combine the two providers itself. That
 happens in the next cell.
 
-**Honest limitation:** Alpha Vantage's free plan is capped at 25
-requests/**day** (not just per-minute) — a handful of real-company
-profile/financials lookups in one session can exhaust it for the rest of
-the day, surfaced as an ordinary `rate_limited:...` tool failure rather
-than a crash. `OVERVIEW` also has no employee count, CEO name, or
-founding year fields at all, unlike FCS API's old `/stock/profile` — those
-fields are just honestly absent now, never fabricated.'''))
-cells.append(code(load_and_clean("alpha_vantage_market_data.py")))
+**Honest limitation:** treat any Yahoo Finance failure as expected and
+survivable (`merged_market_data.py` in the next cell never depends on it
+succeeding), not as a bug to chase — an unrecognized ticker, a rate limit,
+or an outright endpoint change all surface as an ordinary tool failure,
+never a crash. Unlike the earlier Alpha Vantage version of this
+integration, employee count IS available here; CEO name and founding year
+still aren't — those fields are just honestly absent, never fabricated.'''))
+cells.append(code(load_and_clean("yahoo_finance_market_data.py")))
 
 cells.append(md('''## 1d. Combining both providers, field by field
 
 `merged_market_data.py` is what `tools_node` (Section 7) actually calls
 for a real company — not `real_market_data.py` or
-`alpha_vantage_market_data.py` directly. It combines the two providers'
+`yahoo_finance_market_data.py` directly. It combines the two providers'
 results **field by field, not provider by provider**: Twelve Data's value
 wins wherever it actually has one; any field Twelve Data is missing — its
 call failed outright, or it simply never returns that field at all (true
-of every real financials field) — is filled in from Alpha Vantage. A
+of every real financials field) — is filled in from Yahoo Finance. A
 field is never silently dropped and never invented: it's either a real
 number from one of the two providers, or genuinely absent from both.
 
 Price is handled differently from profile/financials: Twelve Data's
-`/quote` is tried first, and Alpha Vantage's `GLOBAL_QUOTE` is only called
+`/quote` is tried first, and Yahoo Finance's price fields are only read
 as a **fallback** if that fails — Twelve Data's free plan is already
-reliable for price, so there's no reason to spend any of Alpha Vantage's
-much tighter free-tier quota on a call that would almost always just
-duplicate data Twelve Data already provided.
+reliable for price, so the common case never depends on Yahoo Finance's
+unofficial endpoints at all.
 
 The merged result's `source` field names every provider that actually
-contributed data this turn (e.g. `"twelvedata.com + alphavantage.co
+contributed data this turn (e.g. `"twelvedata.com + finance.yahoo.com
 (live, merged)"`), and `note` lists which specific fields were filled in
 from the secondary provider — both render as-is in the transparency panel
 (Section 11's Gradio UI, and the standalone React UI), so provenance
-stays visible, not just success/failure. Both market-data keys are
-independent and optional: set either, both, or neither in Section 0's
-`.env` — missing one just means its provider's "call" is an instant, free
-`missing_..._api_key` result rather than a network call.'''))
+stays visible, not just success/failure. Yahoo Finance needs no key and
+is therefore always available; `TWELVEDATA_API_KEY` in Section 0's `.env`
+is the only one of the two that's actually optional — unset, and
+real-company questions still get live profile/financials from Yahoo
+Finance alone.'''))
 cells.append(code(load_and_clean("merged_market_data.py")))
 
 # =============================================================================
@@ -897,20 +893,16 @@ cells.append(md('''### 10b. Optional: live real-company query
 Not part of the graded 23-check suite above (it needs a real LLM and a
 real network call, neither of which is reproducible/offline), but a quick
 way to see the Section 1b-1d real-data integration actually working.
-Skips itself cleanly if `MOCK_LLM = True` or neither `TWELVEDATA_API_KEY`
-nor `ALPHA_VANTAGE_API_KEY` was set — the question below asks about
-financials specifically so that, with only `TWELVEDATA_API_KEY` set, you
-can see its honest `plan_restricted` limitation first-hand; add a free
-`ALPHA_VANTAGE_API_KEY` too (Section 1c) to see that gap actually
-close.'''))
+Skips itself cleanly if `MOCK_LLM = True` -- that's now the only gate,
+since Yahoo Finance (Section 1c) needs no API key at all and always
+provides profile/financials data; `TWELVEDATA_API_KEY` being unset just
+means the live price specifically falls back to Yahoo Finance too (see
+Section 1d), not that the whole demo is skipped.'''))
 cells.append(code('''import json
 
 print("Optional live demo: a real company (Apple, Microsoft, Alphabet, Amazon, Tesla, NVIDIA)")
 if MOCK_LLM:
     print("Skipped — set MOCK_LLM = False in Section 0 to query a real LLM + real market data.")
-elif _is_placeholder(os.environ.get("TWELVEDATA_API_KEY", "")) and _is_placeholder(os.environ.get("ALPHA_VANTAGE_API_KEY", "")):
-    print("Skipped — add a free TWELVEDATA_API_KEY and/or ALPHA_VANTAGE_API_KEY to .env in Section 0 to enable this.")
-    print("Sign up free (no credit card) at https://twelvedata.com/pricing and/or https://www.alphavantage.co/support/#api-key")
 else:
     result = chat("real_demo", "What's Apple's current stock price, revenue growth, and profit margins?")
     print(result["response"])
@@ -918,9 +910,9 @@ else:
     print("\\nTool results:")
     print(json.dumps(state.get("tool_results", {}), indent=2, default=str))
     print("\\nFlags:", state.get("flags", []))
-    print("\\n(With only TWELVEDATA_API_KEY set, expect a tool_failure/plan_restricted note on")
-    print(" get_company_financials's revenue/margin fields — see Section 1b. Add a free ALPHA_VANTAGE_API_KEY")
-    print(" too (Section 1c) to see merged_market_data.py (Section 1d) fill those fields in instead.)")'''))
+    print("\\n(Yahoo Finance (Section 1c) needs no API key, so revenue/margin fields should be")
+    print(" populated here regardless of whether TWELVEDATA_API_KEY was set in Section 0 — see")
+    print(" merged_market_data.py (Section 1d) for how the two providers are combined.)")'''))
 
 # =============================================================================
 # Cell 14 — Optional Gradio UI

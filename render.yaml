@@ -15,8 +15,8 @@ services:
         value: "0.35"
       - key: TWELVEDATA_CACHE_TTL_SECONDS
         value: "30"
-      - key: ALPHA_VANTAGE_CACHE_TTL_SECONDS
-        value: "120"
+      - key: YAHOO_FINANCE_CACHE_TTL_SECONDS
+        value: "30"
       # --- Secrets: sync: false means Render will prompt for these in the
       # dashboard and never store the value in this file or in git. Set
       # them once under the service's Environment tab after it's created. ---
@@ -28,8 +28,11 @@ services:
         sync: false                   # optional — e.g. a Vocareum proxy URL instead of api.openai.com (used for both embeddings and chat)
       - key: TWELVEDATA_API_KEY
         sync: false                   # optional — enables real-company (AAPL/MSFT/...) live data
-      - key: ALPHA_VANTAGE_API_KEY
-        sync: false                   # optional — fills in profile/financials data Twelve Data's free plan can't provide; see merged_market_data.py
+      # No Yahoo Finance key here -- yahoo_finance_market_data.py (via the
+      # yfinance package) needs no API key at all. It fills in
+      # profile/financials data Twelve Data's free plan can't provide;
+      # see merged_market_data.py. Only its cache TTL is configurable,
+      # declared as non-secret config above.
 
   # --- Second service: the Gradio chat UI, deployed separately from the
   # API above and talking to it only over HTTP (API_BASE_URL). This block

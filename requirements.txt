@@ -12,3 +12,9 @@ langchain-anthropic>=0.2.0
 langchain-text-splitters>=0.3.0
 langgraph>=0.2.0
 faiss-cpu>=1.8.0
+# yfinance is left UNPINNED on purpose: it ships frequent point releases
+# specifically to track Yahoo Finance's own undocumented endpoint changes
+# (see yahoo_finance_market_data.py's module docstring), the same
+# fast-churning-dependency reasoning the notebook's install cell already
+# uses for faiss-cpu/sentence-transformers/gradio.
+yfinance

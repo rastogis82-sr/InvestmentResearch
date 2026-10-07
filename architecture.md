@@ -168,7 +168,7 @@ using a free, no-credit-card `TWELVEDATA_API_KEY`.
   ```
   The `get_merged_*` functions (`merged_market_data.py`, see Section 5c)
   are what actually call Twelve Data — as of Section 5c they also call
-  Alpha Vantage and merge the two, but `tools_node` itself doesn't know or care;
+  Yahoo Finance and merge the two, but `tools_node` itself doesn't know or care;
   it's still a two-way dispatch on `is_real_company`, same as when there
   was only one real-data provider. No other node changes shape to support
   this — `reconcile_node`,
@@ -191,9 +191,10 @@ using a free, no-credit-card `TWELVEDATA_API_KEY`.
   just say so" contract, now holding up against a real API's real plan
   restrictions instead of a simulated failure, rather than being treated
   as a bug to work around. **This specific gap is what Section 5c's second
-  provider (Alpha Vantage) closes** — Twelve Data alone still has it; the
-  `get_merged_*` functions `tools_node` actually calls do not, as long as
-  `ALPHA_VANTAGE_API_KEY` is also set.
+  provider (Yahoo Finance) closes** — Twelve Data alone still has it; the
+  `get_merged_*` functions `tools_node` actually calls do not — Yahoo
+  Finance needs no API key at all, so this gap is closed by default,
+  unlike the earlier providers that needed a key set first.
 - **Real companies will always show `rag_failure`:** the synthetic corpus
   only contains documents about ABC/XYZ/DEF, so any real-company question
   correctly flags no matching document found — this is expected, not an
@@ -222,7 +223,7 @@ using a free, no-credit-card `TWELVEDATA_API_KEY`.
 
 ---
 
-## 5c. Closing the data gap: a second provider (Alpha Vantage), merged field by field
+## 5c. Closing the data gap: a second provider (Yahoo Finance), merged field by field
 
 Section 5b's honest limitation — Twelve Data's free plan can't serve
 company profile at all, and has no fundamentals/income-statement endpoint
@@ -233,149 +234,151 @@ reuses `/profile`'s company-level fields and says so explicitly). Adding a
 second, independent live-data provider closes that gap without touching
 anything about how Twelve Data itself works.
 
-**Provider history — why this section no longer names FCS API.** The
-first version of this integration used FCS API's Stock Market API
-(fcsapi.com) as the secondary provider, based on its own published
-documentation, which did not flag `/stock/profile` as requiring a paid
-plan (unlike `/stock/earnings`, explicitly marked "Stock Corporate+" on
-FCS's own pricing page). A live test against a real FCS API free-tier key
-during deployment testing showed the opposite: FCS API's free plan
-rejects **every** stock endpoint outright — `"A Free API Key user cannot
-be used with stock/index endpoint. Please upgrade your plan."` — a
-documentation-vs-reality mismatch on FCS API's side, not a bug in this
-project's request/response handling (the merge code reported both
-providers' real failures honestly; it just had nothing to merge once FCS
-API's call failed every time). Alpha Vantage replaced FCS API as the
-secondary provider because its free tier has no endpoint-level gating:
-every function works on a free key, the only constraint is a request-
-count ceiling. `fcs_market_data.py` and `test_fcs_market_data.py` were
-deleted rather than kept alongside the new module, since a secondary
-provider that cannot be used on a free plan has no reason to stay in the
-codebase.
+**Provider history.** This integration has used three different
+secondary providers, each replaced for a concrete, documented reason —
+not churn for its own sake:
 
-- **`alpha_vantage_market_data.py`** is the Alpha Vantage counterpart to
+1. **FCS API** (fcsapi.com) — its documentation did not flag
+   `/stock/profile` as requiring a paid plan (unlike `/stock/earnings`,
+   explicitly marked "Stock Corporate+" on FCS's own pricing page). A
+   live test against a real FCS API free-tier key during deployment
+   testing showed the opposite: FCS API's free plan rejects **every**
+   stock endpoint outright — `"A Free API Key user cannot be used with
+   stock/index endpoint. Please upgrade your plan."` — a
+   documentation-vs-reality mismatch on FCS API's side, not a bug in this
+   project's request/response handling. `fcs_market_data.py` was deleted.
+2. **Alpha Vantage** — replaced FCS API because its free tier has no
+   endpoint-level gating, just a 25-requests/**day** ceiling. A real bug
+   was caught and fixed in this version too: Alpha Vantage's own
+   daily-quota-exceeded message is delivered under an `"Information"`
+   body key whose text — `"We have detected your API key as <KEY> and
+   our standard API rate limit is 25 requests per day..."` — contains the
+   substring "API key", which an earlier version of the error classifier
+   mistook for an invalid-key message rather than an exhausted quota. The
+   fix (checking rate-limit phrases before the invalid-key check) and a
+   regression test using the exact live message text both existed in that
+   version; see this section's git history / the delivered zip from that
+   stage if you want the detail. `alpha_vantage_market_data.py` and
+   `test_alpha_vantage_market_data.py` were deleted when this provider
+   was replaced.
+3. **Yahoo Finance** (current) — the user explicitly asked to standardize
+   on Twelve Data + Yahoo Finance only, dropping every other provider.
+   Accessed via the widely-used `yfinance` package rather than hand-rolled
+   HTTP calls against Yahoo's endpoints directly, since those endpoints
+   require a cookie/crumb authentication dance that `yfinance` already
+   implements and keeps up to date as Yahoo changes it. No API key, no
+   signup, no published rate limit — but also no official support or SLA,
+   since `yfinance` wraps Yahoo's own internal, undocumented web
+   endpoints rather than a published REST API. See
+   `yahoo_finance_market_data.py`'s module docstring for the full honest
+   trade-off.
+
+- **`yahoo_finance_market_data.py`** is the Yahoo Finance counterpart to
   `real_market_data.py` — same never-raise `{"ok": ..., "tool": ...,
   "data"/"error": ...}` contract, same request-level response cache
-  (`ALPHA_VANTAGE_CACHE_TTL_SECONDS`, default 120s — higher than the other
-  two modules' 30s default, because Alpha Vantage's quota is per-**day**,
-  not just per-minute, so a cached answer is worth holding onto longer).
-  It exposes `get_alpha_vantage_stock_price` (`GLOBAL_QUOTE`) and two
-  functions that both read from the **same** `OVERVIEW` call —
-  `get_alpha_vantage_company_profile` (sector, industry, address/country as
-  `hq`, description, website, market cap — all on Alpha Vantage's **free**
-  plan, unlike Twelve Data's equivalent) and
-  `get_alpha_vantage_company_financials` (revenue, gross/operating/net
-  margin, P/E ratio, EBITDA, and year-over-year revenue growth, all
-  derived from the same `OVERVIEW` response's trailing-twelve-month
-  fields). Calling `OVERVIEW` once per ticker and sharing it between
-  profile and financials via the module-level cache is deliberate: it
-  halves the number of requests spent against the tight 25-requests/day
-  free ceiling compared to two separate endpoint calls. `net_income_usd_m`
-  is the one calculated field here (`RevenueTTM × ProfitMargin` — Alpha
-  Vantage's `OVERVIEW` has no direct net-income field), and is labeled as
-  calculated in the result's `note` so the transparency panel never
-  implies it's a raw reported figure.
+  (`YAHOO_FINANCE_CACHE_TTL_SECONDS`, default 30s). It exposes
+  `get_yahoo_stock_price`, `get_yahoo_company_profile`, and
+  `get_yahoo_company_financials`, all three reading from the **same**
+  cached `yfinance.Ticker(ticker).info` call — mirroring the
+  one-call-covers-both design the Alpha Vantage version used for profile
+  and financials, extended here to price as well, since `.info` already
+  contains price fields too. A real company looked up for all three
+  things in one turn costs exactly one underlying Yahoo request, not
+  three. `yfinance` raises real Python exceptions on failure rather than
+  returning a structured error body the way Twelve Data's and Alpha
+  Vantage's REST responses do; `_get_yahoo_info` wraps every call in a
+  broad `try/except`, classifying by the exception's type name and
+  message, so this module's own never-raise contract holds regardless of
+  what `yfinance` does internally. Unlike the Alpha Vantage version,
+  employee count (`fullTimeEmployees`) IS available here, and
+  `net_income_usd_m` comes directly from `netIncomeToCommon` rather than
+  being calculated from other fields.
 - **`merged_market_data.py`** is what `tools_node` actually calls for a
   real company now (`get_merged_stock_price` / `get_merged_company_profile`
   / `get_merged_company_financials`) — it combines the two single-provider
   modules' output, field by field, not provider by provider:
-  - **Price**: Twelve Data's `/quote` first; Alpha Vantage's
-    `GLOBAL_QUOTE` only as a **fallback** if that call fails. Twelve
-    Data's free plan is already reliable for price, so there's no reason
-    to spend any of Alpha Vantage's much tighter free-tier quota (25
-    requests/day — see `alpha_vantage_market_data.py`'s module docstring)
-    on a call that would almost always just duplicate data Twelve Data
-    already provided.
+  - **Price**: Twelve Data's `/quote` first; Yahoo Finance's price fields
+    only as a **fallback** if that call fails. Twelve Data's free plan is
+    already reliable for price, so the common case never depends on
+    Yahoo Finance's unofficial endpoints at all.
   - **Profile and financials**: both providers are called (concurrently,
     via a `ThreadPoolExecutor`), and the two results are merged field by
     field — Twelve Data's value wins wherever it actually has one; any
     field Twelve Data is missing, whether because its call failed
     outright or because it simply never returns that field at all (true
     of every financials field except the profile-derived ones), is filled
-    in from Alpha Vantage. A field is never silently dropped and never
+    in from Yahoo Finance. A field is never silently dropped and never
     invented — it's either a real number from one of the two providers,
-    or genuinely absent from both. (Alpha Vantage's `OVERVIEW` has no
-    employee count, CEO name, or founding year fields at all — those
-    fields simply don't appear in the merged result anymore, rather than
-    being fabricated or carried over from the old FCS-based version.)
+    or genuinely absent from both. (Yahoo Finance's `.info` has no CEO
+    name or founding year — those fields simply don't appear in the
+    merged result, rather than being fabricated.)
   - The merged `data.source` names every provider that actually
-    contributed a field this turn (e.g. `"twelvedata.com + alphavantage.co
-    (live, merged)"`, or just `"alphavantage.co (live)"` if Twelve Data's
-    call failed entirely), and `data.note` lists which specific fields
-    were filled in from the secondary provider — the transparency panel
-    (both the Gradio and React UIs) renders both of these as-is, so
-    provenance stays visible, not just success/failure.
+    contributed a field this turn (e.g. `"twelvedata.com +
+    finance.yahoo.com (live, merged)"`, or just `"finance.yahoo.com
+    (live)"` if Twelve Data's call failed entirely), and `data.note`
+    lists which specific fields were filled in from the secondary
+    provider — the transparency panel (both the Gradio and React UIs)
+    renders both of these as-is, so provenance stays visible, not just
+    success/failure.
   - `merged_market_data.py`'s merge only reports `ok=False` if **both**
     providers failed completely — the system degrades by losing specific
     fields, never by losing the whole answer when partial real data
     exists.
-- **New fields reaching the UI**: `website`, `market_cap_usd_b`,
-  `pe_ratio`, `ebitda_usd_m`, and (now genuinely populated)
-  `revenue_usd_m` / `net_income_usd_m` / `revenue_growth_yoy_pct` /
-  `net_margin_pct` / `gross_margin_pct` / `operating_margin_pct` all flow
-  through the existing generic tool-card rendering in both `gradio_app.py`
-  and `react-ui/src/components/ToolCard.tsx` with no UI restructuring
-  needed — `_format_value`/`_humanize_key` (and their TypeScript ports in
-  `react-ui/src/format.ts`) already had the two additions this needed from
-  the earlier FCS-based version, kept identical across both: a `_usd_b`
-  suffix that auto-scales to `$X.XXT` above $1,000B (`market_cap_usd_b`
-  for a company the size of Apple would otherwise print as an unwieldy
-  `$3,806.3B`), and a small acronym-fixup table (`pe_ratio` → `P/E Ratio`,
-  `hq` → `HQ`) applied after the existing title-casing step.
-- **Degrades independently, not as a package deal**: `TWELVEDATA_API_KEY`
-  and `ALPHA_VANTAGE_API_KEY` are two unrelated optional environment
-  variables (see `RENDER_DEPLOY.md`). Set both for the richest merged
-  data; set either alone and `merged_market_data.py` just uses that one
-  provider's fields (the other's "call" is a clean, free, instant
-  `missing_..._api_key` failure, not a network call); set neither and
-  real-company questions get an honest `tool_failure`, exactly as before
-  this section existed — the synthetic ABC/XYZ/DEF path never calls either
-  provider regardless.
-- **Honest limitations, specific to Alpha Vantage**: its free plan's
-  25-requests-per-**day** cap (not just per-minute) is tight enough that a
-  handful of real-company lookups in a single demo session can exhaust it
-  for the rest of the day — this surfaces as an ordinary `rate_limited:...`
-  tool failure (Alpha Vantage signals this with a `"Note"` key inside an
-  otherwise-200-OK response body, not an HTTP status code — handled
-  explicitly in `_alpha_vantage_get`, along with an `"Information"` key for
-  a bad/demo API key and an `"Error Message"` key for a bad symbol). The
-  response shapes in `alpha_vantage_market_data.py` are taken from Alpha
-  Vantage's own published documentation and its GAAP fundamentals field
-  reference, not verified against the live API — this sandbox has no
-  outbound network access to third-party APIs to test against, the same
-  constraint `real_market_data.py` and the earlier FCS-based module were
-  built under. Smoke-test both `alpha_vantage_market_data.py`'s and
-  `merged_market_data.py`'s `__main__` blocks with a real key in Colab
-  before relying on this in front of a grader.
-- **A real misclassification bug, caught live and fixed.** The first
-  deployed version of `_alpha_vantage_get` classified any `"Information"`-
-  body message containing the substring `"api key"` as `invalid_api_key`.
-  A live Render deployment test then hit Alpha Vantage's actual
-  daily-quota-exceeded message — `"We have detected your API key as
-  <KEY> and our standard API rate limit is 25 requests per day..."` —
-  which contains that exact substring, so a perfectly valid key that had
-  simply used up its free 25-requests/day quota was misreported as
-  invalid. Fixed by checking for rate-limit phrases (`"rate limit"`,
-  `"requests per day"`, `"requests per minute"`) **before** the
-  invalid-key check, since those phrases are specific to the quota
-  message and "demo" is specific to the actual invalid-key message. A
-  regression test (`test_alpha_vantage_market_data.py`, using the exact
-  message text from the live response) now locks this in.
-- Verified with 47 unit tests in `test_alpha_vantage_market_data.py`
-  (mocked `requests.get` against Alpha Vantage's documented example
-  response shapes — success, missing key, rate limiting via the `"Note"`
-  body key, the daily-quota-exceeded message via the `"Information"` body
-  key (the regression test above), an invalid/demo API key also via
-  `"Information"`, a bad symbol returning an empty `{}`, the literal
-  string `"None"` standing in for a missing field, a network timeout, the
-  response-cache behavior, and the OVERVIEW-shared-between-profile-and-
-  financials cache reuse) and 26 unit tests in `test_merged_market_data.py`
-  (the merge logic itself, using hand-built provider results rather than
-  mocked HTTP — Twelve Data succeeding alone, Alpha Vantage succeeding
-  alone, both succeeding with Twelve Data's fields correctly winning and
-  Alpha Vantage only filling genuine gaps, and both failing) — **73/73
-  pass**, plus `test_real_market_data.py` (35/35) and `test_harness.py`
-  (23/23) both confirmed still passing unchanged.
+- **New fields reaching the UI**: `website`, `employees`,
+  `market_cap_usd_b`, `pe_ratio`, `ebitda_usd_m`, and (now genuinely
+  populated) `revenue_usd_m` / `net_income_usd_m` / `revenue_growth_yoy_pct`
+  / `net_margin_pct` / `gross_margin_pct` / `operating_margin_pct` all
+  flow through the existing generic tool-card rendering in both
+  `gradio_app.py` and `react-ui/src/components/ToolCard.tsx` with no UI
+  restructuring needed — `_format_value`/`_humanize_key` (and their
+  TypeScript ports in `react-ui/src/format.ts`) already had the additions
+  this needed from the earlier provider versions, kept identical across
+  both: a `_usd_b` suffix that auto-scales to `$X.XXT` above $1,000B
+  (`market_cap_usd_b` for a company the size of Apple would otherwise
+  print as an unwieldy `$3,806.3B`), and a small acronym-fixup table
+  (`pe_ratio` → `P/E Ratio`, `hq` → `HQ`) applied after the existing
+  title-casing step.
+- **No key means no "degrades independently" story this time — Yahoo
+  Finance is always on.** `TWELVEDATA_API_KEY` is still the only secret
+  involved: set it for the richest merged data (reliable price from
+  Twelve Data plus profile/financials from Yahoo Finance); leave it
+  unset and real-company questions still get live profile/financials
+  from Yahoo Finance alone, just without Twelve Data's steadier price
+  feed. The synthetic ABC/XYZ/DEF path never calls either provider
+  regardless.
+- **Honest limitations, specific to Yahoo Finance.** Unlike Twelve Data
+  and Alpha Vantage, Yahoo Finance has no official, documented, supported
+  public API — `yfinance` works by calling the same internal endpoints
+  Yahoo's own website uses, which can change, rate-limit, or get blocked
+  (including, anecdotally, a specific cloud hosting provider's whole IP
+  range) at any time without notice or a published SLA. This is a real
+  trade-off against "no key, no signup, no published cap" convenience,
+  not a detail to gloss over. The response shapes in
+  `yahoo_finance_market_data.py` are taken from `yfinance`'s long-stable
+  `Ticker.info` dict shape, not verified against a live call — this
+  sandbox has no outbound network access to third-party services
+  (confirmed to extend even to PyPI itself while building this module —
+  `pip install yfinance` could not be tested here either) to verify
+  against, the same constraint every earlier provider module in this
+  project was built under. Smoke-test `yahoo_finance_market_data.py`'s
+  and `merged_market_data.py`'s `__main__` blocks with a real deployment
+  in Colab/Render before relying on this in front of a grader, and treat
+  any sudden Yahoo-side failure as expected and survivable (the merge
+  layer already never depends on it succeeding), not as a bug to chase.
+- Verified with 38 unit tests in `test_yahoo_finance_market_data.py`
+  (a mocked `yfinance.Ticker` rather than mocked HTTP, since `yfinance` is
+  the thing being wrapped here — success with the shared-info-across-
+  price/profile/financials cache reuse, an unrecognized ticker's
+  near-empty info dict, a simulated rate-limit exception, a simulated
+  network exception, the response-cache behavior, and partial data with
+  some fields genuinely missing) and 26 unit tests in
+  `test_merged_market_data.py` (the merge logic itself, using hand-built
+  provider results rather than mocked HTTP/yfinance — Twelve Data
+  succeeding alone, Yahoo Finance succeeding alone, both succeeding with
+  Twelve Data's fields correctly winning and Yahoo Finance only filling
+  genuine gaps, and both failing) — **64/64 pass**, plus
+  `test_real_market_data.py` (35/35) and `test_harness.py` (23/23) both
+  confirmed still passing unchanged.
 
 ---
 
@@ -532,8 +535,7 @@ NGROK_AUTH_TOKEN=your_ngrok_token_here
 | `IRA_CORPUS_DIR` | `/tmp/investment_research_kb` | Where the synthetic knowledge base is written before indexing. |
 | `TWELVEDATA_API_KEY` | unset | Optional. Enables real-company (AAPL/MSFT/GOOGL/AMZN/TSLA/NVDA) market data via Twelve Data — see Section 5b. Unset or missing just makes real-company tool calls fail cleanly (`missing_twelvedata_api_key`); the synthetic ABC/XYZ/DEF universe is unaffected either way. |
 | `TWELVEDATA_CACHE_TTL_SECONDS` | `"30"` | How long a Twelve Data response is cached in memory before a repeat call re-hits the network — see Section 9b. Set to `"0"` to disable caching entirely. |
-| `ALPHA_VANTAGE_API_KEY` | unset | Optional, independent of `TWELVEDATA_API_KEY`. Fills in company profile and real financial-statement data Twelve Data's free plan can't provide at all — see Section 5c. Unset just means `merged_market_data.py` uses whatever Twelve Data alone returned. |
-| `ALPHA_VANTAGE_CACHE_TTL_SECONDS` | `"120"` | Same purpose as `TWELVEDATA_CACHE_TTL_SECONDS`, for Alpha Vantage's response cache — higher default than the other two modules' 30s, since Alpha Vantage's quota is per-day, not just per-minute; see Section 5c. |
+| `YAHOO_FINANCE_CACHE_TTL_SECONDS` | `"30"` | Same purpose as `TWELVEDATA_CACHE_TTL_SECONDS`, for Yahoo Finance's response cache — see Section 5c. No API key variable exists for Yahoo Finance at all; it needs none. |
 
 ### Endpoints
 
@@ -892,18 +894,20 @@ dashboard steps):
 - `requirements.txt` — every package the service actually imports
   (FastAPI/Uvicorn, LangGraph/LangChain + both `langchain-openai` and
   `langchain-anthropic` since `LLM_PROVIDER` supports either, FAISS,
-  `python-dotenv`, `requests`), each pinned to a minimum version. Notably
-  absent: `langchain-huggingface` / `sentence-transformers` / `torch` —
-  see below.
+  `python-dotenv`, `requests`), each pinned to a minimum version, plus
+  `yfinance` left deliberately **unpinned** (same fast-churning-dependency
+  reasoning as faiss-cpu/sentence-transformers/gradio in the notebook's
+  install cell — see Section 5c). Notably absent: `langchain-huggingface`
+  / `sentence-transformers` / `torch` — see below.
 - `render.yaml` — build command (`pip install -r requirements.txt`),
   start command (`uvicorn investment_research_api:app --host 0.0.0.0
   --port 10000`), `healthCheckPath: /health`, and the full set of
   environment variables the app reads. Non-secret config (`MOCK_LLM`,
   `LLM_PROVIDER`, `IRA_SCORE_THRESHOLD`, `TWELVEDATA_CACHE_TTL_SECONDS`,
-  `ALPHA_VANTAGE_CACHE_TTL_SECONDS`) is inlined directly in the file since
+  `YAHOO_FINANCE_CACHE_TTL_SECONDS`) is inlined directly in the file since
   there's nothing sensitive about it; every actual secret
   (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_BASE_URL`,
-  `TWELVEDATA_API_KEY`, `ALPHA_VANTAGE_API_KEY`) is declared with
+  `TWELVEDATA_API_KEY`) is declared with
   `sync: false`, which makes Render prompt for the value in its dashboard
   rather than storing it in this version-controlled file.
 - `.env.example` — a template (placeholder values only) documenting every

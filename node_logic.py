@@ -47,10 +47,10 @@ from tools_mock import (
 # known_real_companies) still comes straight from real_market_data.py --
 # that part never involved a second provider. The three actual data calls
 # (price/profile/financials) go through merged_market_data.py instead,
-# which combines Twelve Data with Alpha Vantage: Twelve Data's free plan
+# which combines Twelve Data with Yahoo Finance: Twelve Data's free plan
 # can't serve company profile or any real financial-statement data at all
 # (see real_market_data.py's module docstring), so merged_market_data.py
-# fills those gaps in from Alpha Vantage field by field rather than
+# fills those gaps in from Yahoo Finance field by field rather than
 # reporting a tool_failure for data a second provider genuinely has. See
 # merged_market_data.py's module docstring for the full merge strategy.
 from real_market_data import REAL_COMPANIES, resolve_real_ticker_or_none, known_real_companies
@@ -333,9 +333,9 @@ def tools_node(state: dict) -> dict:
         # pool below has resolved guarantees that cache hit instead of
         # racing the profile call for the same ticker. merged_market_data.py
         # itself already parallelizes each of these three calls' own two
-        # providers (Twelve Data + Alpha Vantage) internally — see its
-        # module docstring for the full merge strategy and why Alpha
-        # Vantage is only ever called as a price fallback, not on every
+        # providers (Twelve Data + Yahoo Finance) internally — see its
+        # module docstring for the full merge strategy and why Yahoo
+        # Finance is only ever called as a price fallback, not on every
         # price lookup.
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             profile_future = pool.submit(get_merged_company_profile, ticker)

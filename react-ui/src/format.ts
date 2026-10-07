@@ -23,7 +23,7 @@ export function humanizeFlag(flag: string): string {
 // Small set of acronyms/abbreviations title-casing mangles (e.g. "Ceo"
 // instead of "CEO") -- applied after title-casing. Kept identical to
 // gradio_app.py's _KEY_LABEL_FIXUPS so both UIs render the same labels
-// for fields contributed by alpha_vantage_market_data.py (pe_ratio, hq).
+// for fields contributed by yahoo_finance_market_data.py (pe_ratio, hq).
 // "Ceo" is kept in this map even though no current provider returns a
 // ceo field -- harmless if unused, and free to reactivate if a future
 // provider adds one back.
@@ -74,7 +74,7 @@ export function formatValue(key: string, value: unknown): string {
       const sign = value >= 0 ? "+" : "";
       return `${sign}${value.toFixed(2)}%`;
     }
-    // market_cap_usd_b (from Alpha Vantage, see alpha_vantage_market_data.py)
+    // market_cap_usd_b (from Yahoo Finance, see yahoo_finance_market_data.py)
     // is already in BILLIONS -- auto-scale to trillions above 1000, same as
     // gradio_app.py's _format_value, rather than printing an unwieldy
     // "$3,806.3B" for a company the size of Apple.

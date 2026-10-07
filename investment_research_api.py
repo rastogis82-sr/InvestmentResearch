@@ -40,17 +40,11 @@ Configuration (environment variables, all optional with sane defaults):
                         https://twelvedata.com/pricing. Without it, its
                         calls fail cleanly (missing_twelvedata_api_key)
                         rather than fabricating data.
-    ALPHA_VANTAGE_API_KEY
-                        Optional, independent of TWELVEDATA_API_KEY.
-                        Fills in company profile and real
-                        financial-statement data (revenue, margins, YoY
-                        growth) that Twelve Data's free plan can't
-                        provide at all — see merged_market_data.py. Free
-                        signup at
-                        https://www.alphavantage.co/support/#api-key
-                        (free tier: 25 requests/day). Set either, both,
-                        or neither of these two keys; ABC/XYZ/DEF are
-                        unaffected either way.
+    (Yahoo Finance, the second real-company market-data provider, needs
+    NO API key at all -- see yahoo_finance_market_data.py. It fills in
+    company profile and real financial-statement data that Twelve Data's
+    free plan can't provide at all, independent of whether
+    TWELVEDATA_API_KEY is set; ABC/XYZ/DEF are unaffected either way.)
 
 All of the above are read from the process environment — never
 hardcoded in this file. Locally (or in Vocareum), copy `.env.example` to
@@ -626,110 +620,139 @@ def get_real_company_financials(ticker: str) -> dict:
 
 
 # =============================================================================
-# Real-company market data, provider 2 (Alpha Vantage) — identical to
-# alpha_vantage_market_data.py. Closes the exact gap provider 1's free
-# plan leaves: company profile and real financial-statement data
-# (revenue, margins, YoY growth). Set ALPHA_VANTAGE_API_KEY to enable it
-# (free signup at https://www.alphavantage.co/support/#api-key, free
-# tier: 25 requests/day); without it, its calls fail cleanly the same
-# way. Independent of TWELVEDATA_API_KEY -- set either, both, or neither.
+# Real-company market data, provider 2 (Yahoo Finance, via the yfinance
+# package) — identical to yahoo_finance_market_data.py. Closes the exact
+# gap provider 1's free plan leaves: company profile and real
+# financial-statement data (revenue, margins, YoY growth). No API key, no
+# signup, no published rate limit -- unofficial/undocumented endpoints
+# though, see the module's own docstring for the honest trade-off.
+# Always available regardless of whether TWELVEDATA_API_KEY is set.
 # =============================================================================
 """
-alpha_vantage_market_data.py
+yahoo_finance_market_data.py
 ------------------------------
 A second live-data source for the same curated real-company universe
-`real_market_data.py` already covers (AAPL/MSFT/GOOGL/AMZN/TSLA/NVDA),
-backed by Alpha Vantage (https://www.alphavantage.co/documentation/).
+`real_market_data.py` already covers (AAPL/MSFT/GOOGL/AMZN/TSLA/NVDA), via
+Yahoo Finance's data, accessed through the `yfinance` package
+(https://github.com/ranaroussi/yfinance) rather than hand-rolled HTTP calls.
 
-This REPLACES fcs_market_data.py as the secondary provider. FCS API's
-documentation implied its `/stock/profile` and `/stock/statistics` /
-`/stock/income_statements` endpoints were free-plan accessible, but a live
-test against the user's real FCS API key showed the opposite: FCS API's
-free plan rejects EVERY stock endpoint outright ("A Free API Key user
-cannot be used with stock/index endpoint. Please upgrade your plan.") —
-not a documentation gap on our side, a documentation-vs-reality mismatch
-on FCS API's own site. Alpha Vantage's free tier, by contrast, has no
-endpoint-level gating: any function works on a free key, the constraint
-is purely a request-count ceiling (25 requests/day, 5 requests/minute —
-see https://www.alphavantage.co/premium/).
+This REPLACES alpha_vantage_market_data.py as the secondary provider, at
+the user's explicit request to keep only Twelve Data and Yahoo Finance.
+(Earlier still, FCS API was the secondary provider and had to be dropped
+because its free plan rejected every stock endpoint outright — see
+merged_market_data.py's module docstring for that history. Alpha Vantage
+worked but came with its own tight 25-requests/day free-tier ceiling.)
 
-Why this module exists at all (same gap as fcs_market_data.py was closing):
-Twelve Data's free plan can't provide `get_company_profile` (`/profile`
-is plan-restricted) or real `get_company_financials` figures (no free
-fundamentals endpoint exists at all — see real_market_data.py's module
-docstring). Alpha Vantage's `OVERVIEW` function covers both gaps in a
-SINGLE call: it returns company profile fields (sector, industry,
-description, address, website) AND trailing-twelve-month financial
-fields (RevenueTTM, GrossProfitTTM, ProfitMargin, OperatingMarginTTM,
-QuarterlyRevenueGrowthYOY, EBITDA, MarketCapitalization, PERatio) in one
-response. That one-call-covers-both design is deliberate here: given
-Alpha Vantage's tight 25-requests/day free ceiling, calling `OVERVIEW`
-once per ticker and reusing it for both `get_alpha_vantage_company_profile`
-and `get_alpha_vantage_company_financials` (via the module-level cache
-below) costs half what two separate endpoints would.
+Why this module exists at all (same gap every secondary provider here has
+closed in turn): Twelve Data's free plan can't provide `get_company_profile`
+(`/profile` is plan-restricted) or real `get_company_financials` figures
+(no free fundamentals endpoint exists at all — see real_market_data.py's
+module docstring). A single `yfinance.Ticker(ticker).info` call covers
+both gaps at once: it returns company profile fields (sector, industry,
+description, address, website, employee count) AND financial fields
+(trailing P/E, profit/gross/operating margins, total revenue, EBITDA,
+revenue growth, market cap) in one dict. That one-call-covers-both design
+mirrors the earlier Alpha Vantage module's `OVERVIEW` call and is kept
+here too: `_get_yahoo_info` is cached per-ticker and shared by
+`get_yahoo_company_profile`, `get_yahoo_company_financials`, AND
+`get_yahoo_stock_price` below, so a real company looked up for all three
+things in the same turn costs exactly one underlying Yahoo request, not
+three.
 
-Requires an Alpha Vantage API key (free signup, no credit card):
-https://www.alphavantage.co/support/#api-key — set via the
-ALPHA_VANTAGE_API_KEY environment variable. If it's missing, every call
-below returns a clean {"ok": False, "error": "missing_alpha_vantage_api_key"}
+No API key is required — `yfinance` is a thin wrapper around Yahoo
+Finance's own (undocumented, unofficial) web endpoints, the same way a
+browser visiting finance.yahoo.com gets this data, not a published,
+versioned, rate-limit-documented public API the way Twelve Data and Alpha
+Vantage are. That is a real, honest trade-off, not a detail to gloss
+over — see Honest limitations below.
+
+Requires the `yfinance` package (`pip install yfinance`; already in
+requirements.txt). If it isn't importable for any reason, every call
+below returns a clean {"ok": False, "error": "missing_yfinance_package"}
 result rather than raising, exactly like real_market_data.py does for a
-missing Twelve Data key.
+missing Twelve Data key — no API key is needed, so there is no
+"missing_..._api_key" case here the way there is for Twelve Data / the
+earlier Alpha Vantage module.
 
 Honest limitations — read before being surprised by an unfamiliar error:
-  - Free tier is 25 requests/DAY (not per-minute) and 5 requests/minute
-    (https://www.alphavantage.co/premium/). That daily cap is tight
-    enough that `_CACHE_TTL_SECONDS` defaults higher here than the other
-    two market-data modules' 30-second default — see below — but a cache
-    TTL only helps within one process's lifetime; it cannot stretch a
-    hard daily quota across a classroom's worth of demo runs. Budget
-    accordingly when demoing live.
-  - Alpha Vantage signals rate-limiting and plan/key problems INSIDE a
-    200 OK response body, not via HTTP status codes: a `"Note"` key means
-    the per-minute/per-day limit was hit, an `"Information"` key means a
-    bad/demo API key or an unrecognized function, and an `"Error Message"`
-    key means a bad symbol or malformed parameter. `_alpha_vantage_get`
-    below checks for all three before trusting the payload as real data.
-  - `OVERVIEW` does not include employee count, CEO name, or founding
-    year (the fields FCS API's `/stock/profile` used to supply) — Alpha
-    Vantage simply doesn't have a field for these. `merged_market_data.py`
-    is built to never fabricate a field that genuinely isn't available
-    from either provider, so those three fields are just honestly absent
-    now rather than back-filled with a guess.
-  - `OVERVIEW`'s numeric fields come back as JSON STRINGS (e.g.
-    `"ProfitMargin": "0.2431"`, a fraction, not a percentage — multiply by
-    100 before treating it as one), and a field Alpha Vantage doesn't have
-    data for is the literal string `"None"`, not JSON null. `_to_float`
-    below handles both.
-  - Response field names below are taken from Alpha Vantage's own
-    published documentation and the GAAP fundamentals field reference
-    (https://www.alphavantage.co/documentation/,
-    https://documentation.alphavantage.co/FundamentalDataDocs/gaap_documentation.html),
-    the same "verified against docs, not against the live API" approach
-    the other two market-data modules use — this sandbox has no outbound
-    network access to third-party APIs to test against the live service
-    either. Smoke-test with a real key in Colab before trusting this in
-    front of a grader (see the `__main__` block at the bottom).
+  - Yahoo Finance has no official, documented, supported public API.
+    `yfinance` (and every library like it) works by calling the same
+    internal endpoints Yahoo's own website uses, which Yahoo can change,
+    rate-limit, or block at any time without notice and without a
+    published SLA — unlike Twelve Data's and Alpha Vantage's versioned,
+    documented REST APIs. It has worked reliably for a long time and is
+    very widely used, but "widely used and currently working" is a
+    different guarantee than "documented and supported." Treat any
+    failure here (and especially a sudden block from a specific hosting
+    provider's IP range, which Yahoo has been known to do to deployed
+    cloud services more aggressively than to home/residential IPs) as
+    expected and survivable, not as a bug to chase — this is exactly why
+    `get_merged_*` in merged_market_data.py never depends on Yahoo
+    succeeding, same as every other secondary-provider integration here.
+  - `yfinance` raises real Python exceptions on request failure (HTTP
+    errors, rate limiting, JSON decode failures) rather than returning a
+    structured error object the way Twelve Data's and Alpha Vantage's
+    REST responses do. `_get_yahoo_info` below wraps every call in a
+    broad `try/except Exception`, classifying by the exception's own
+    type name and message, so this module's own contract — never raise,
+    always return `{"ok": False, "error": ..., "tool": ...}` — holds
+    regardless of what `yfinance` itself does internally.
+  - An unrecognized ticker does not raise in `yfinance` — it returns an
+    `info` dict with only a couple of placeholder keys (observed in
+    practice as something like `{"trailingPegRatio": None}` with
+    everything else absent). `_get_yahoo_info` treats "fewer than a
+    handful of real keys" as an effectively empty response, the same
+    honest-failure outcome as Alpha Vantage's bad-symbol `{}` or FCS
+    API's `empty_response`.
+  - `yfinance`'s `.info` property does not carry a CEO name or founding
+    year (the fields FCS API's `/stock/profile` used to supply, back when
+    FCS API was usable at all) — but unlike Alpha Vantage's `OVERVIEW`, it
+    DOES include employee count (`fullTimeEmployees`), so that field is
+    back after being absent in the Alpha Vantage version of this
+    integration.
+  - Response field names below are taken from `yfinance`'s long-stable
+    `Ticker.info` dict shape, the same "verified against well-established
+    behavior, not against a live call" approach the other market-data
+    modules use — this sandbox has no outbound network access to
+    third-party services (including PyPI itself, confirmed while building
+    this module) to test against the live service or even install
+    `yfinance` to inspect it directly. Smoke-test with a real deployment
+    in Colab/Render before trusting this in front of a grader (see the
+    `__main__` block at the bottom), and don't be surprised if Yahoo's
+    exact field set has shifted slightly by the time you do — `yfinance`
+    itself ships frequent point releases specifically to track Yahoo's
+    endpoint changes, which is also why it's left unpinned in
+    requirements.txt (same reasoning as faiss-cpu/sentence-transformers/
+    gradio in the notebook's install cell).
 """
 
 import os
 import time
 from typing import Optional
 
-import requests
+try:
+    import yfinance as yf
+    _YFINANCE_IMPORT_ERROR: Optional[str] = None
+except Exception as e:  # pragma: no cover -- exercised only if yfinance truly isn't installed
+    yf = None
+    _YFINANCE_IMPORT_ERROR = type(e).__name__
 
-ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query"
-_SESSION = requests.Session()
-# Higher default than real_market_data.py / fcs_market_data.py's 30s: Alpha
-# Vantage's quota is per-DAY (25/day), not just per-minute, so it's worth
-# holding a cached answer longer within one process's lifetime.
-_CACHE_TTL_SECONDS = float(os.environ.get("ALPHA_VANTAGE_CACHE_TTL_SECONDS", "120"))
+_CACHE_TTL_SECONDS = float(os.environ.get("YAHOO_FINANCE_CACHE_TTL_SECONDS", "30"))
 _CACHE: dict = {}
+
+# A real yfinance .info response for a known ticker has dozens of keys.
+# An unrecognized/delisted ticker still returns a dict, but with only a
+# couple of placeholder keys (e.g. just "trailingPegRatio": None) and no
+# actual company data -- this threshold is what distinguishes "real data"
+# from "Yahoo silently found nothing", the same role an empty {} response
+# played for Alpha Vantage.
+_MIN_INFO_KEYS_FOR_REAL_TICKER = 5
 
 
 def clear_cache() -> None:
-    """Same purpose as real_market_data.clear_cache() / fcs_market_data's
-    equivalent — mainly for tests and for debugging a live data issue
-    without restarting the process."""
+    """Same purpose as real_market_data.clear_cache() / the earlier Alpha
+    Vantage module's equivalent — mainly for tests and for debugging a
+    live data issue without restarting the process."""
     _CACHE.clear()
 
 
@@ -749,29 +772,8 @@ def _cache_set(key, value: dict) -> None:
         _CACHE[key] = (time.time(), value)
 
 
-def _get_api_key() -> str:
-    return os.environ.get("ALPHA_VANTAGE_API_KEY", "").strip()
-
-
-def _clean_str(value) -> Optional[str]:
-    """Alpha Vantage uses the literal string "None" for a text field it has
-    no data for too (not just numeric fields) -- same normalization as
-    _to_float, just returning the original string instead of a float."""
-    if value is None:
-        return None
-    if isinstance(value, str) and value.strip().lower() in ("none", ""):
-        return None
-    return value
-
-
 def _to_float(value) -> Optional[float]:
-    """Alpha Vantage returns numeric fields as JSON strings, and uses the
-    literal string "None" (not JSON null) for a field it has no data for.
-    Handles both, same contract as the other two market-data modules'
-    _to_float helpers."""
     if value is None:
-        return None
-    if isinstance(value, str) and value.strip().lower() in ("none", ""):
         return None
     try:
         return float(value)
@@ -779,194 +781,156 @@ def _to_float(value) -> Optional[float]:
         return None
 
 
-def _alpha_vantage_get(params: dict, tool_name: str, cache_key_suffix: str = "") -> dict:
-    """Shared request helper, same never-raise contract as
-    real_market_data._twelvedata_get / fcs_market_data._fcsapi_get:
-    whatever goes wrong (missing key, network error, bad symbol, rate
-    limit) comes back as {"ok": False, "error": ..., "tool": ...}, never
-    an exception. Returns {"ok": True, "tool": ..., "data": <raw payload>}
-    on success -- callers map the raw Alpha Vantage field names to this
-    project's own field names."""
-    symbol = params.get("symbol", "")
-    function = params.get("function", "")
-    cache_key = (function, symbol, cache_key_suffix)
+def _clean_str(value) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
+def _get_yahoo_info(ticker: str, tool_name: str) -> dict:
+    """Shared fetch+cache helper, same never-raise contract as
+    real_market_data._twelvedata_get / the earlier Alpha Vantage module's
+    _alpha_vantage_get: whatever goes wrong (yfinance not installed,
+    network error, rate limiting, an unrecognized ticker) comes back as
+    {"ok": False, "error": ..., "tool": ...}, never an exception. Cached
+    per-ticker and shared by ALL THREE get_yahoo_* functions below -- see
+    the module docstring for why one call covering price+profile+
+    financials is deliberate."""
+    cache_key = ticker.upper()
     cached = _cache_get(cache_key)
     if cached is not None:
         return {**cached, "tool": tool_name}
 
-    api_key = _get_api_key()
-    if not api_key:
-        return {"ok": False, "error": "missing_alpha_vantage_api_key", "tool": tool_name}
+    if yf is None:
+        return {
+            "ok": False,
+            "error": f"missing_yfinance_package:{_YFINANCE_IMPORT_ERROR}",
+            "tool": tool_name,
+        }
 
     try:
-        resp = _SESSION.get(
-            ALPHA_VANTAGE_BASE_URL,
-            params={**params, "apikey": api_key},
-            timeout=10,
-        )
-    except requests.exceptions.RequestException as e:
-        # Never cached -- a transient network blip isn't a deterministic
-        # fact about this ticker/endpoint (see real_market_data.py for the
-        # same reasoning).
+        info = yf.Ticker(ticker.upper()).info
+    except Exception as e:
+        # Never cached -- a transient network/rate-limit blip isn't a
+        # deterministic fact about this ticker (see real_market_data.py
+        # for the same reasoning). yfinance doesn't give us a structured
+        # error the way a REST JSON body does, so classify by exception
+        # type/message instead.
+        error_text = f"{type(e).__name__}:{e}".lower()
+        if "429" in error_text or "rate limit" in error_text or "too many requests" in error_text:
+            return {"ok": False, "error": f"rate_limited:{type(e).__name__}", "tool": tool_name}
         return {"ok": False, "error": f"network_error:{type(e).__name__}", "tool": tool_name}
 
-    if resp.status_code != 200:
-        return {"ok": False, "error": f"api_error_{resp.status_code}:http_status", "tool": tool_name}
-
-    try:
-        payload = resp.json()
-    except ValueError:
-        return {"ok": False, "error": f"non_json_response:status_{resp.status_code}", "tool": tool_name}
-
-    if not isinstance(payload, dict):
-        result = {"ok": False, "error": "unexpected_response_shape", "tool": tool_name}
-        return result
-
-    # Alpha Vantage signals problems INSIDE a 200 OK body -- see the module
-    # docstring's Honest limitations.
-    if "Note" in payload:
-        result = {"ok": False, "error": f"rate_limited:{payload['Note']}", "tool": tool_name}
-        # Deterministic for the rest of this quota window -- don't keep
-        # re-asking an already-rate-limited question and burning more of
-        # the 25-requests/day free quota.
-        _cache_set(cache_key, result)
-        return result
-    if "Information" in payload:
-        message = str(payload["Information"])
-        message_l = message.lower()
-        # IMPORTANT, confirmed against a real live response: Alpha Vantage's
-        # own daily-quota-exceeded message is delivered under the
-        # "Information" key (not "Note"), and reads "We have detected your
-        # API key as <KEY> and our standard API rate limit is 25 requests
-        # per day...". That message contains the substring "api key", so
-        # the rate-limit phrases below MUST be checked first -- otherwise
-        # a real daily-quota hit gets misclassified as an invalid/bad key,
-        # which is actively misleading (the key is fine; the quota is
-        # exhausted for the day and will reset on its own).
-        if "rate limit" in message_l or "requests per day" in message_l or "requests per minute" in message_l:
-            result = {"ok": False, "error": f"rate_limited:{message}", "tool": tool_name}
-        elif "demo" in message_l:
-            result = {"ok": False, "error": f"invalid_api_key:{message}", "tool": tool_name}
-        else:
-            result = {"ok": False, "error": f"api_error:{message}", "tool": tool_name}
-        _cache_set(cache_key, result)
-        return result
-    if "Error Message" in payload:
-        result = {"ok": False, "error": f"api_error:{payload['Error Message']}", "tool": tool_name}
-        _cache_set(cache_key, result)
-        return result
-
-    if not payload:
-        # Alpha Vantage's OVERVIEW returns an empty {} for an unrecognized
-        # symbol, with none of the three error keys above set.
+    if not isinstance(info, dict) or len(info) < _MIN_INFO_KEYS_FOR_REAL_TICKER:
         result = {"ok": False, "error": "empty_response", "tool": tool_name}
         _cache_set(cache_key, result)
         return result
 
-    result = {"ok": True, "tool": tool_name, "data": payload}
+    result = {"ok": True, "tool": tool_name, "data": info}
     _cache_set(cache_key, result)
     return result
 
 
-def _get_overview(ticker: str, tool_name: str) -> dict:
-    """OVERVIEW is cached per-ticker and shared by BOTH
-    get_alpha_vantage_company_profile and get_alpha_vantage_company_financials
-    below -- see the module docstring for why one call covering both is
-    deliberate given the 25-requests/day free ceiling. `tool_name` is only
-    used to label the result if this particular call fails; the cache key
-    itself is keyed on (function, symbol) so profile and financials share
-    the same cached entry regardless of which one asked first."""
-    return _alpha_vantage_get({"function": "OVERVIEW", "symbol": ticker.upper()}, tool_name)
-
-
-def get_alpha_vantage_stock_price(ticker: str) -> dict:
-    """Live price snapshot via Alpha Vantage's `GLOBAL_QUOTE` function.
-    Used by merged_market_data.py only as a FALLBACK when Twelve Data's
-    own `/quote` call fails -- Twelve Data's free plan already covers
-    price reliably, so this conserves Alpha Vantage's especially tight
-    daily quota for profile/financials, where Twelve Data's free plan
-    can't help at all."""
-    result = _alpha_vantage_get({"function": "GLOBAL_QUOTE", "symbol": ticker.upper()}, "get_stock_price")
+def get_yahoo_stock_price(ticker: str) -> dict:
+    """Live-ish price snapshot via yfinance's `Ticker.info`. Used by
+    merged_market_data.py only as a FALLBACK when Twelve Data's own
+    `/quote` call fails -- Twelve Data's free plan already covers price
+    reliably, so this conserves Yahoo Finance's unofficial, undocumented
+    endpoints for the cases that actually need them: profile and
+    financials, where Twelve Data's free plan can't help at all."""
+    result = _get_yahoo_info(ticker, "get_stock_price")
     if not result["ok"]:
         return result
-    quote = (result["data"] or {}).get("Global Quote") or {}
-    if not quote:
-        return {"ok": False, "error": "empty_response", "tool": "get_stock_price"}
-    change_pct_raw = quote.get("10. change percent", "")
-    change_pct = _to_float(str(change_pct_raw).rstrip("%")) if change_pct_raw else None
+    info = result["data"] or {}
+    price = _to_float(info.get("currentPrice")) or _to_float(info.get("regularMarketPrice"))
+    # NOTE: yfinance's price-change fields (regularMarketChangePercent)
+    # come back already in percent units (e.g. -0.21 means -0.21%), NOT a
+    # 0-1 fraction -- unlike its margin/growth-ratio fields below
+    # (profitMargins, grossMargins, revenueGrowth, ...), which ARE
+    # fractions and do need *100. Mixing these two conventions up was a
+    # real risk carried over from the Alpha Vantage version of this
+    # module, where every percent-shaped field was a fraction -- confirmed
+    # against yfinance's well-established field conventions, not a live
+    # call (see the module docstring).
+    change_pct = _to_float(info.get("regularMarketChangePercent"))
     return {
         "ok": True,
         "tool": "get_stock_price",
         "data": {
-            "last_price_usd": _to_float(quote.get("05. price")),
+            "last_price_usd": price,
             "day_change_pct": change_pct,
-            "volume": _to_float(quote.get("06. volume")),
-            "as_of": quote.get("07. latest trading day"),
-            "source": "alphavantage.co (live)",
+            "volume": _to_float(info.get("regularMarketVolume")),
+            "source": "finance.yahoo.com (live, via yfinance)",
         },
     }
 
 
-def get_alpha_vantage_company_profile(ticker: str) -> dict:
-    """Company profile via Alpha Vantage's `OVERVIEW` function -- sector,
-    industry, HQ, description, website, and market cap. All available on
-    Alpha Vantage's free plan (unlike Twelve Data's equivalent, which
-    needs a paid plan). Note: OVERVIEW has no employee count, CEO name, or
-    founding year fields at all -- those simply aren't included here (see
-    the module docstring's Honest limitations), not silently dropped."""
-    result = _get_overview(ticker, "get_company_profile")
+def get_yahoo_company_profile(ticker: str) -> dict:
+    """Company profile via yfinance's `Ticker.info` -- sector, industry,
+    HQ, description, employee count, website, and market cap. All
+    available with no API key or paid plan, unlike Twelve Data's
+    equivalent. Unlike the earlier Alpha Vantage version of this
+    integration, employee count (`fullTimeEmployees`) IS available here;
+    CEO name and founding year still aren't (yfinance's `.info` has
+    neither), so those stay honestly absent rather than guessed."""
+    result = _get_yahoo_info(ticker, "get_company_profile")
     if not result["ok"]:
         return result
-    o = result["data"] or {}
-    market_cap = _to_float(o.get("MarketCapitalization"))
-    address = _clean_str(o.get("Address"))
-    country = _clean_str(o.get("Country"))
-    hq = ", ".join(x for x in [address, country] if x)
+    info = result["data"] or {}
+    market_cap = _to_float(info.get("marketCap"))
+    city = _clean_str(info.get("city"))
+    state = _clean_str(info.get("state"))
+    country = _clean_str(info.get("country"))
+    hq = ", ".join(x for x in [city, state, country] if x)
     return {
         "ok": True,
         "tool": "get_company_profile",
         "data": {
-            "name": _clean_str(o.get("Name")),
-            "sector": _clean_str(o.get("Sector")),
-            "industry": _clean_str(o.get("Industry")),
+            "name": _clean_str(info.get("longName")) or _clean_str(info.get("shortName")),
+            "sector": _clean_str(info.get("sector")),
+            "industry": _clean_str(info.get("industry")),
             "hq": hq or None,
-            "description": _clean_str(o.get("Description")),
-            "website": _clean_str(o.get("OfficialSite")),
+            "description": _clean_str(info.get("longBusinessSummary")),
+            "employees": info.get("fullTimeEmployees"),
+            "website": _clean_str(info.get("website")),
             "market_cap_usd_b": market_cap / 1e9 if market_cap is not None else None,
-            "source": "alphavantage.co (live)",
+            "source": "finance.yahoo.com (live, via yfinance)",
         },
     }
 
 
-def get_alpha_vantage_company_financials(ticker: str) -> dict:
+def get_yahoo_company_financials(ticker: str) -> dict:
     """Real margins, revenue, and a real year-over-year revenue-growth
-    figure, all from the SAME `OVERVIEW` call `get_alpha_vantage_company_profile`
+    figure, all from the SAME `Ticker.info` call `get_yahoo_company_profile`
     already makes (and shares via the module-level cache) -- the one
     endpoint Twelve Data's free plan has no equivalent for at all.
-    `net_income_usd_m` is calculated (RevenueTTM x ProfitMargin), not a
-    field Alpha Vantage returns directly -- labeled as such in `note` so
-    the transparency panel never implies it's a raw reported figure."""
-    result = _get_overview(ticker, "get_company_financials")
+    `net_income_usd_m` comes directly from yfinance's `netIncomeToCommon`
+    when present; unlike the Alpha Vantage version of this integration,
+    nothing here needs to be calculated from other fields."""
+    result = _get_yahoo_info(ticker, "get_company_financials")
     if not result["ok"]:
         return result
-    o = result["data"] or {}
+    info = result["data"] or {}
 
-    revenue_ttm = _to_float(o.get("RevenueTTM"))
-    profit_margin = _to_float(o.get("ProfitMargin"))
-    gross_profit_ttm = _to_float(o.get("GrossProfitTTM"))
-    operating_margin = _to_float(o.get("OperatingMarginTTM"))
-    revenue_growth = _to_float(o.get("QuarterlyRevenueGrowthYOY"))
-    market_cap = _to_float(o.get("MarketCapitalization"))
-    pe_ratio = _to_float(o.get("PERatio"))
-    ebitda = _to_float(o.get("EBITDA"))
+    revenue = _to_float(info.get("totalRevenue"))
+    net_margin = _to_float(info.get("profitMargins"))
+    gross_margin = _to_float(info.get("grossMargins"))
+    operating_margin = _to_float(info.get("operatingMargins"))
+    revenue_growth = _to_float(info.get("revenueGrowth"))
+    market_cap = _to_float(info.get("marketCap"))
+    pe_ratio = _to_float(info.get("trailingPE"))
+    ebitda = _to_float(info.get("ebitda"))
+    net_income = _to_float(info.get("netIncomeToCommon"))
 
     data: dict = {}
-    if revenue_ttm is not None:
-        data["revenue_usd_m"] = revenue_ttm / 1e6
-    if profit_margin is not None:
-        data["net_margin_pct"] = profit_margin * 100
-    if revenue_ttm is not None and gross_profit_ttm is not None:
-        data["gross_margin_pct"] = gross_profit_ttm / revenue_ttm * 100 if revenue_ttm else None
+    if revenue is not None:
+        data["revenue_usd_m"] = revenue / 1e6
+    if net_margin is not None:
+        data["net_margin_pct"] = net_margin * 100
+    if gross_margin is not None:
+        data["gross_margin_pct"] = gross_margin * 100
     if operating_margin is not None:
         data["operating_margin_pct"] = operating_margin * 100
     if revenue_growth is not None:
@@ -977,21 +941,13 @@ def get_alpha_vantage_company_financials(ticker: str) -> dict:
         data["market_cap_usd_b"] = market_cap / 1e9
     if ebitda is not None:
         data["ebitda_usd_m"] = ebitda / 1e6
-    if revenue_ttm is not None and profit_margin is not None:
-        data["net_income_usd_m"] = revenue_ttm * profit_margin / 1e6
-    fiscal_quarter = _clean_str(o.get("LatestQuarter"))
-    if fiscal_quarter:
-        data["fiscal_year"] = fiscal_quarter
+    if net_income is not None:
+        data["net_income_usd_m"] = net_income / 1e6
 
     if not data:
         return {"ok": False, "tool": "get_company_financials", "error": "empty_response"}
 
-    notes = []
-    if "net_income_usd_m" in data:
-        notes.append("net_income_usd_m is calculated (RevenueTTM x ProfitMargin), not a figure Alpha Vantage reports directly.")
-    if notes:
-        data["note"] = " ".join(notes)
-    data["source"] = "alphavantage.co (live)"
+    data["source"] = "finance.yahoo.com (live, via yfinance)"
     return {"ok": True, "tool": "get_company_financials", "data": data}
 
 
@@ -1006,40 +962,57 @@ def get_alpha_vantage_company_financials(ticker: str) -> dict:
 """
 merged_market_data.py
 ----------------------
-Combines real_market_data.py (Twelve Data) and alpha_vantage_market_data.py
-(Alpha Vantage) into the three provider-agnostic functions node_logic.py's
-`tools_node` actually calls for a real company — `get_merged_stock_price`,
-`get_merged_company_profile`, `get_merged_company_financials`. Same
-`{"ok": True/False, ...}` contract either single-provider module already
-uses, so nothing downstream has to know two providers were ever involved.
+Combines real_market_data.py (Twelve Data) and yahoo_finance_market_data.py
+(Yahoo Finance, via the `yfinance` package) into the three
+provider-agnostic functions node_logic.py's `tools_node` actually calls
+for a real company — `get_merged_stock_price`, `get_merged_company_profile`,
+`get_merged_company_financials`. Same `{"ok": True/False, ...}` contract
+either single-provider module already uses, so nothing downstream has to
+know two providers were ever involved.
 
 Why two providers at all: Twelve Data's free plan is reliable for price
 but can't help with profile (`/profile` is paid-plan-only) or financials
 (no free fundamentals endpoint exists at all — see
-real_market_data.py's module docstring). Alpha Vantage's free plan covers
-exactly that gap via its `OVERVIEW` function (sector, industry,
-description, address, website, plus TTM revenue/margin figures), at the
-cost of a much tighter overall request quota (25/day, not just
-per-minute). Neither provider is "better" — they're combined because each
-covers a hole the other has.
+real_market_data.py's module docstring). Yahoo Finance (via `yfinance`)
+covers exactly that gap with no API key and no published rate limit at
+all, at the cost of being an unofficial, undocumented interface rather
+than a supported REST API — see yahoo_finance_market_data.py's module
+docstring for that honest trade-off. Neither provider is "better" —
+they're combined because each covers a hole the other has.
 
-NOTE on provider history: an earlier version of this module used FCS API
-(fcsapi.com) as the secondary provider. FCS API's own documentation did
-not flag its `/stock/profile` endpoint as requiring a paid plan, but a
-live test against a real FCS API free-tier key showed it rejects EVERY
-stock endpoint outright ("A Free API Key user cannot be used with
-stock/index endpoint. Please upgrade your plan.") — a documentation-vs-
-reality mismatch on FCS API's side, not a bug here. Alpha Vantage's free
-tier has no such endpoint-level gating (see alpha_vantage_market_data.py's
-module docstring), so it replaced FCS API as the secondary provider.
+Provider history — this module has used three different secondary
+providers, in order, each dropped or replaced for a concrete reason:
+  1. **FCS API** (fcsapi.com) — its documentation did not flag
+     `/stock/profile` as paid-plan-only, but a live test against a real
+     free-tier key showed FCS API rejects EVERY stock endpoint on its
+     free plan ("A Free API Key user cannot be used with stock/index
+     endpoint. Please upgrade your plan.") — a documentation-vs-reality
+     mismatch on FCS API's side. Dropped entirely; `fcs_market_data.py`
+     was deleted rather than kept around unusable.
+  2. **Alpha Vantage** — free tier worked with no endpoint-level gating,
+     but is capped at a tight 25 requests/day (not just per-minute),
+     which a single classroom demo session could exhaust. A real bug was
+     also caught and fixed in that version: Alpha Vantage's own
+     daily-quota-exceeded message is delivered under an `"Information"`
+     body key containing the substring "API key" ("We have detected your
+     API key as ... and our standard API rate limit is 25 requests per
+     day..."), which an earlier classifier mistakenly read as an invalid
+     key rather than an exhausted quota. Replaced at the user's explicit
+     request to standardize on Twelve Data + Yahoo Finance only;
+     `alpha_vantage_market_data.py` was deleted.
+  3. **Yahoo Finance** (current) — no API key, no published daily/monthly
+     cap, via the widely-used `yfinance` package. The trade-off is that
+     it's an unofticial interface to Yahoo's own internal endpoints, not
+     a documented, versioned, SLA-backed API the way Twelve Data and
+     Alpha Vantage both are — see yahoo_finance_market_data.py's module
+     docstring for the full honest-limitations discussion.
 
 Merge strategy, field by field, not provider by provider:
   - **Price**: Twelve Data is the primary and (on its free plan) already
-    reliable source. Alpha Vantage's `GLOBAL_QUOTE` is only called as a
-    FALLBACK, when Twelve Data's call itself fails -- deliberately, to
-    conserve Alpha Vantage's especially tight 25-requests/day free quota
-    for profile/financials, where Twelve Data's free plan can't help at
-    all and Alpha Vantage is actually needed every time.
+    reliable source. Yahoo Finance's price fields are only read as a
+    FALLBACK, when Twelve Data's call itself fails -- deliberately, so
+    the common case (Twelve Data succeeding) never depends on Yahoo
+    Finance's unofficial endpoints at all.
   - **Profile and financials**: both providers are queried, and the
     result is a FIELD-LEVEL merge, not a pick-one-provider merge. Twelve
     Data's fields win where it actually has them (it's generally the
@@ -1047,12 +1020,12 @@ Merge strategy, field by field, not provider by provider:
     have — either because its call failed outright (free-plan
     restriction) or because it simply doesn't return that field at all
     (Twelve Data's "financials" never includes real revenue/margin
-    figures, paid plan or not) — is filled in from Alpha Vantage instead.
+    figures, paid plan or not) — is filled in from Yahoo Finance instead.
     A field is never silently dropped and never fabricated: it's either a
     real number from one of the two providers, or absent.
   - The merged result's `source` field names every provider that actually
     contributed at least one field this turn (e.g. "twelvedata.com +
-    alphavantage.co (live, merged)"), and a `note` is appended naming
+    finance.yahoo.com (live, merged)"), and a `note` is appended naming
     which specific fields came from the secondary provider -- so the
     transparency panel stays honest about provenance, not just about
     success/failure.
@@ -1061,22 +1034,22 @@ Merge strategy, field by field, not provider by provider:
 import concurrent.futures
 
 # Deliberately "from X import name1, name2" rather than "import X as td" /
-# "import X as av": build_api_app.py and assemble_notebook.py inline this
-# file's source directly into investment_research_api.py / the notebook
-# (stripping only "from <local module> import ..." lines, since the
-# functions end up sharing one flat namespace there, not a real importable
-# package) -- the same convention node_logic.py's own local-module imports
-# already follow. An "import X as td" alias would survive that stripping
-# unchanged and then fail at runtime wherever real_market_data.py /
-# alpha_vantage_market_data.py aren't ALSO deployed as sibling files next
-# to investment_research_api.py.
+# "import X as yf_md": build_api_app.py and assemble_notebook.py inline
+# this file's source directly into investment_research_api.py / the
+# notebook (stripping only "from <local module> import ..." lines, since
+# the functions end up sharing one flat namespace there, not a real
+# importable package) -- the same convention node_logic.py's own
+# local-module imports already follow. An "import X as td" alias would
+# survive that stripping unchanged and then fail at runtime wherever
+# real_market_data.py / yahoo_finance_market_data.py aren't ALSO deployed
+# as sibling files next to investment_research_api.py.
 
 # Fields that describe the RESPONSE itself, not actual company data -- never
 # treated as a "field to merge", just regenerated fresh by _merge() itself.
 _META_FIELDS = ("source", "note")
 
 
-def _merge(primary: dict, secondary: dict, tool_name: str, secondary_label: str = "alphavantage.co") -> dict:
+def _merge(primary: dict, secondary: dict, tool_name: str, secondary_label: str = "finance.yahoo.com") -> dict:
     """Field-level merge of two {"ok": ..., "data": {...}} results for the
     SAME tool call. `primary`'s fields always win when present; anything
     `primary` is missing (its call failed entirely, or it succeeded but
@@ -1126,49 +1099,49 @@ def _merge(primary: dict, secondary: dict, tool_name: str, secondary_label: str 
 
 
 def get_merged_stock_price(ticker: str) -> dict:
-    """Twelve Data's /quote first; Alpha Vantage's GLOBAL_QUOTE ONLY as a
+    """Twelve Data's /quote first; Yahoo Finance's price fields ONLY as a
     fallback if that fails. See module docstring for why this one isn't a
     field-level merge like profile/financials are."""
     primary = get_real_stock_price(ticker)
     if primary.get("ok"):
         return primary
-    fallback = get_alpha_vantage_stock_price(ticker)
+    fallback = get_yahoo_stock_price(ticker)
     if fallback.get("ok"):
-        fallback["data"]["note"] = f"Twelve Data unavailable this turn ({primary.get('error')}); using Alpha Vantage instead."
+        fallback["data"]["note"] = f"Twelve Data unavailable this turn ({primary.get('error')}); using Yahoo Finance instead."
         return fallback
     return {
         "ok": False,
         "tool": "get_stock_price",
-        "error": f"twelvedata:{primary.get('error')}; alphavantage.co:{fallback.get('error')}",
+        "error": f"twelvedata:{primary.get('error')}; finance.yahoo.com:{fallback.get('error')}",
     }
 
 
 def get_merged_company_profile(ticker: str) -> dict:
-    """Twelve Data + Alpha Vantage's OVERVIEW, run concurrently (two
-    different providers, no shared cache or rate limit to serialize for)
-    and merged field by field."""
+    """Twelve Data + Yahoo Finance, run concurrently (two different
+    providers, no shared cache or rate limit to serialize for) and merged
+    field by field."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         td_future = pool.submit(get_real_company_profile, ticker)
-        av_future = pool.submit(get_alpha_vantage_company_profile, ticker)
+        yahoo_future = pool.submit(get_yahoo_company_profile, ticker)
         td_result = td_future.result()
-        av_result = av_future.result()
-    return _merge(td_result, av_result, "get_company_profile")
+        yahoo_result = yahoo_future.result()
+    return _merge(td_result, yahoo_result, "get_company_profile")
 
 
 def get_merged_company_financials(ticker: str) -> dict:
     """Twelve Data's financials (company-profile fields only, reused from
-    its cached /profile response -- see real_market_data.py) + Alpha
-    Vantage's real revenue/margin figures (from the same OVERVIEW call
-    get_merged_company_profile uses, shared via alpha_vantage_market_data's
-    own cache), merged field by field. Alpha Vantage is the only source of
-    actual financial-statement data here; Twelve Data's free plan has none
-    at all, paid plan or not."""
+    its cached /profile response -- see real_market_data.py) + Yahoo
+    Finance's real revenue/margin figures (from the same `Ticker.info`
+    call get_merged_company_profile uses, shared via
+    yahoo_finance_market_data's own cache), merged field by field. Yahoo
+    Finance is the only source of actual financial-statement data here;
+    Twelve Data's free plan has none at all, paid plan or not."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         td_future = pool.submit(get_real_company_financials, ticker)
-        av_future = pool.submit(get_alpha_vantage_company_financials, ticker)
+        yahoo_future = pool.submit(get_yahoo_company_financials, ticker)
         td_result = td_future.result()
-        av_result = av_future.result()
-    return _merge(td_result, av_result, "get_company_financials")
+        yahoo_result = yahoo_future.result()
+    return _merge(td_result, yahoo_result, "get_company_financials")
 
 
 # =============================================================================
@@ -1968,10 +1941,10 @@ from typing import Optional
 # known_real_companies) still comes straight from real_market_data.py --
 # that part never involved a second provider. The three actual data calls
 # (price/profile/financials) go through merged_market_data.py instead,
-# which combines Twelve Data with Alpha Vantage: Twelve Data's free plan
+# which combines Twelve Data with Yahoo Finance: Twelve Data's free plan
 # can't serve company profile or any real financial-statement data at all
 # (see real_market_data.py's module docstring), so merged_market_data.py
-# fills those gaps in from Alpha Vantage field by field rather than
+# fills those gaps in from Yahoo Finance field by field rather than
 # reporting a tool_failure for data a second provider genuinely has. See
 # merged_market_data.py's module docstring for the full merge strategy.
 
@@ -2248,9 +2221,9 @@ def tools_node(state: dict) -> dict:
         # pool below has resolved guarantees that cache hit instead of
         # racing the profile call for the same ticker. merged_market_data.py
         # itself already parallelizes each of these three calls' own two
-        # providers (Twelve Data + Alpha Vantage) internally — see its
-        # module docstring for the full merge strategy and why Alpha
-        # Vantage is only ever called as a price fallback, not on every
+        # providers (Twelve Data + Yahoo Finance) internally — see its
+        # module docstring for the full merge strategy and why Yahoo
+        # Finance is only ever called as a price fallback, not on every
         # price lookup.
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             profile_future = pool.submit(get_merged_company_profile, ticker)
