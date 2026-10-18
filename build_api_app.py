@@ -61,18 +61,27 @@ def update_memory_node(state: dict, session_id: str = "default-session", safety:
     # review id. Runs on EVERY path (this node is the universal sink —
     # see this function's position in graph_sim.run_turn), so a
     # blank/gibberish/injection/action-request turn is audited exactly
-    # like a normal research turn.
+    # like a normal research turn. Same "bookkeeping, not a decision"
+    # exception as action_preview_node / human_review_gate_node above:
+    # this node's actual job (updating session_entities/messages) must
+    # still complete and return even if the audit-trail write itself
+    # fails — losing one audit record is a far smaller problem than
+    # losing session memory / the turn's reply on every guardrail-
+    # flagged turn.
     safety = safety or SafetyRuntime.default()
-    safety.store.append({
-        "time": datetime.now(timezone.utc).isoformat(),
-        "owner": safety.store.owner(session_id),
-        "input_classification": state.get("input_classification"),
-        "resolved_company": state.get("resolved_company"),
-        "pii_types": sorted((state.get("pii_audit") or {}).keys()),
-        "flags": state.get("flags", []),
-        "action": (state.get("action_request") or {}).get("action"),
-        "review_id": state.get("review_id"),
-    })
+    try:
+        safety.store.append({
+            "time": datetime.now(timezone.utc).isoformat(),
+            "owner": safety.store.owner(session_id),
+            "input_classification": state.get("input_classification"),
+            "resolved_company": state.get("resolved_company"),
+            "pii_types": sorted((state.get("pii_audit") or {}).keys()),
+            "flags": state.get("flags", []),
+            "action": (state.get("action_request") or {}).get("action"),
+            "review_id": state.get("review_id"),
+        })
+    except Exception:
+        pass
     return {"session_entities": new_entities, "messages": messages}''',
     '''# ---------------------------------------------------------------------------
 # Node: update_memory_node  (runs at the end of every path)
@@ -99,16 +108,21 @@ def update_memory_node(state: dict, config: dict) -> dict:
         new_entities["focus"] = state["resolved_focus"]
 
     session_id = config["configurable"]["thread_id"]
-    safety.store.append({
-        "time": datetime.now(timezone.utc).isoformat(),
-        "owner": safety.store.owner(session_id),
-        "input_classification": state.get("input_classification"),
-        "resolved_company": state.get("resolved_company"),
-        "pii_types": sorted((state.get("pii_audit") or {}).keys()),
-        "flags": state.get("flags", []),
-        "action": (state.get("action_request") or {}).get("action"),
-        "review_id": state.get("review_id"),
-    })
+    try:
+        safety.store.append({
+            "time": datetime.now(timezone.utc).isoformat(),
+            "owner": safety.store.owner(session_id),
+            "input_classification": state.get("input_classification"),
+            "resolved_company": state.get("resolved_company"),
+            "pii_types": sorted((state.get("pii_audit") or {}).keys()),
+            "flags": state.get("flags", []),
+            "action": (state.get("action_request") or {}).get("action"),
+            "review_id": state.get("review_id"),
+        })
+    except Exception as exc:
+        logger.warning("Audit-trail write failed (turn still answered)", extra={
+            "session_id": session_id, "error": str(exc),
+        })
 
     # `add_messages` (declared on ResearchState.messages) appends this single
     # new message to the persisted history — no need to rebuild the list.
@@ -211,6 +225,14 @@ class JSONFormatter(logging.Formatter):
         for key, value in record.__dict__.items():
             if key not in logging.LogRecord.__dict__ and key not in log_entry:
                 log_entry[key] = value
+        # record.exc_info (when logger.error(..., exc_info=True) is used)
+        # is a raw (type, value, traceback) tuple -- the generic loop above
+        # would otherwise dump it as an unreadable object repr via
+        # json.dumps(default=str). Render it as actual traceback TEXT
+        # instead, so a Render Logs search for an error message actually
+        # shows what broke, not just that something did.
+        if record.exc_info:
+            log_entry["traceback"] = self.formatException(record.exc_info)
         return json.dumps(log_entry, default=str)
 
 
@@ -685,12 +707,20 @@ def chat(request: ChatRequest):
 
     block = safety.gate.check(request.message, request.session_id, request.consent, request.stopped)
     if block is not None:
-        safety.store.append({{
-            "time": datetime.now(timezone.utc).isoformat(),
-            "owner": safety.store.owner(request.session_id),
-            "input_classification": f"blocked:{{block['reason']}}",
-            "flags": [f"safety_gate_blocked:{{block['reason']}}"],
-        }})
+        # The block decision itself (SafetyGate.check, pure in-memory) has
+        # already happened -- logging it is bookkeeping, so a Store/SQLite
+        # failure here must not turn an already-decided block into a 500.
+        try:
+            safety.store.append({{
+                "time": datetime.now(timezone.utc).isoformat(),
+                "owner": safety.store.owner(request.session_id),
+                "input_classification": f"blocked:{{block['reason']}}",
+                "flags": [f"safety_gate_blocked:{{block['reason']}}"],
+            }})
+        except Exception as audit_exc:
+            logger.warning("Audit-trail write failed (block still returned)", extra={{
+                "session_id": request.session_id, "error": str(audit_exc),
+            }})
         return ChatResponse(
             session_id=request.session_id,
             response=block["message"],
@@ -736,7 +766,14 @@ def chat(request: ChatRequest):
             action_preview=result.get("action_preview"),
         )
     except Exception as e:
-        logger.error("Agent invocation failed", extra={{"session_id": request.session_id, "error": str(e)}})
+        # exc_info=True so the FULL traceback lands in Render's logs, not
+        # just str(e) -- this is what you should grep your deploy's Logs
+        # tab for ("Agent invocation failed") if you ever see a 500 here.
+        logger.error(
+            "Agent invocation failed",
+            extra={{"session_id": request.session_id, "error": str(e)}},
+            exc_info=True,
+        )
         raise HTTPException(
             status_code=500,
             detail="Investment Research Assistant is temporarily unavailable. Please try again.",

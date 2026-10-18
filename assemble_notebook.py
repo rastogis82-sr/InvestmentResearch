@@ -683,18 +683,27 @@ class ResearchState(TypedDict):
     # review id. Runs on EVERY path (this node is the universal sink —
     # see this function's position in graph_sim.run_turn), so a
     # blank/gibberish/injection/action-request turn is audited exactly
-    # like a normal research turn.
+    # like a normal research turn. Same "bookkeeping, not a decision"
+    # exception as action_preview_node / human_review_gate_node above:
+    # this node's actual job (updating session_entities/messages) must
+    # still complete and return even if the audit-trail write itself
+    # fails — losing one audit record is a far smaller problem than
+    # losing session memory / the turn's reply on every guardrail-
+    # flagged turn.
     safety = safety or SafetyRuntime.default()
-    safety.store.append({
-        "time": datetime.now(timezone.utc).isoformat(),
-        "owner": safety.store.owner(session_id),
-        "input_classification": state.get("input_classification"),
-        "resolved_company": state.get("resolved_company"),
-        "pii_types": sorted((state.get("pii_audit") or {}).keys()),
-        "flags": state.get("flags", []),
-        "action": (state.get("action_request") or {}).get("action"),
-        "review_id": state.get("review_id"),
-    })
+    try:
+        safety.store.append({
+            "time": datetime.now(timezone.utc).isoformat(),
+            "owner": safety.store.owner(session_id),
+            "input_classification": state.get("input_classification"),
+            "resolved_company": state.get("resolved_company"),
+            "pii_types": sorted((state.get("pii_audit") or {}).keys()),
+            "flags": state.get("flags", []),
+            "action": (state.get("action_request") or {}).get("action"),
+            "review_id": state.get("review_id"),
+        })
+    except Exception:
+        pass
     return {"session_entities": new_entities, "messages": messages}''',
     '''def update_memory_node(state: dict, config: dict) -> dict:
     # This version differs from node_logic.py's in two ways, both required
@@ -712,16 +721,19 @@ class ResearchState(TypedDict):
         new_entities["focus"] = state["resolved_focus"]
 
     session_id = config["configurable"]["thread_id"]
-    safety.store.append({
-        "time": datetime.now(timezone.utc).isoformat(),
-        "owner": safety.store.owner(session_id),
-        "input_classification": state.get("input_classification"),
-        "resolved_company": state.get("resolved_company"),
-        "pii_types": sorted((state.get("pii_audit") or {}).keys()),
-        "flags": state.get("flags", []),
-        "action": (state.get("action_request") or {}).get("action"),
-        "review_id": state.get("review_id"),
-    })
+    try:
+        safety.store.append({
+            "time": datetime.now(timezone.utc).isoformat(),
+            "owner": safety.store.owner(session_id),
+            "input_classification": state.get("input_classification"),
+            "resolved_company": state.get("resolved_company"),
+            "pii_types": sorted((state.get("pii_audit") or {}).keys()),
+            "flags": state.get("flags", []),
+            "action": (state.get("action_request") or {}).get("action"),
+            "review_id": state.get("review_id"),
+        })
+    except Exception as exc:
+        print(f"[guardrail audit] write failed, turn still answered: {exc!r}")
 
     # `add_messages` (declared on ResearchState.messages) appends this single
     # new message to the persisted history — no need to rebuild the list by
@@ -816,12 +828,18 @@ cells.append(code('''def chat(thread_id: str, user_text: str, consent: bool = Tr
     """Invokes the compiled graph for one turn of a given session."""
     block = safety.gate.check(user_text, thread_id, consent, stopped)
     if block is not None:
-        safety.store.append({
-            "time": datetime.now(timezone.utc).isoformat(),
-            "owner": safety.store.owner(thread_id),
-            "input_classification": f"blocked:{block['reason']}",
-            "flags": [f"safety_gate_blocked:{block['reason']}"],
-        })
+        # The block decision itself has already happened (pure in-memory) --
+        # logging it is bookkeeping, so a Store/SQLite failure here must not
+        # turn an already-decided block into an unhandled exception.
+        try:
+            safety.store.append({
+                "time": datetime.now(timezone.utc).isoformat(),
+                "owner": safety.store.owner(thread_id),
+                "input_classification": f"blocked:{block['reason']}",
+                "flags": [f"safety_gate_blocked:{block['reason']}"],
+            })
+        except Exception as exc:
+            print(f"[guardrail audit] write failed, block still returned: {exc!r}")
         return {"response": block["message"], "input_classification": f"blocked:{block['reason']}", "flags": []}
 
     masked_text, _pii_map = safety.masker.mask(user_text)

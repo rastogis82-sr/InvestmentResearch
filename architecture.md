@@ -510,6 +510,39 @@ are real — this layer governs a chat agent that was already read-only;
 it does not add safety controls to real banking actions the way SafeBank
 AI's original implementation does.
 
+**Production incident found and fixed: audit/review-queue writes must
+fail open, not closed.** The first real deploy of this layer (against the
+live Render API) returned `HTTP 500` on a flagged real-company turn (PII
+in the message + a TwelveData tool failure, which together satisfy
+`flags_warrant_review` and route the turn through `human_review_gate_node`
+for the first time against production SQLite). The initial implementation
+let `Store.append`/`Store.enqueue` raise straight out of
+`human_review_gate_node`, `action_preview_node`, and `update_memory_node`
+— so any transient failure writing the audit DB (disk contention, a
+locked SQLite file, etc.) took the *entire turn* down with it, even
+though the actual answer had already been computed. This is the wrong
+failure mode: this module's own docstring states "every control fails
+closed," which is correct for a *safety decision* (consent, kill switch,
+injection blocking) but was being incorrectly applied to the audit
+trail's I/O — losing one log line is a far smaller problem than losing
+the user's answer. Fixed by wrapping every `Store.append`/`Store.enqueue`
+call site (in all three execution paths — `node_logic.py`, the blocked-
+path append in both `graph_sim.run_turn` and the real API's `/chat` and
+notebook's `chat()`, and the generated `update_memory_node`) in its own
+`try/except`: on failure, the turn still returns its real answer, just
+without a `review_id` (and, for the API, with a `logger.warning` —
+rendered as actual traceback text via a `JSONFormatter` fix, not the
+unreadable object repr `json.dumps(..., default=str)` would otherwise
+produce for a raw `exc_info` tuple — so the *next* occurrence is
+diagnosable from Render's Logs tab instead of only a generic 500).
+Verified with a dedicated fault-injection test (patching `Store.append`/
+`Store.enqueue` to always raise) across all three affected paths —
+research turn, action-preview turn, and a consent-blocked turn — each
+still returns a real response. This does **not** explain why the Store
+write failed in the first place on Render specifically (not reproduced
+in this sandbox under concurrent load); if it recurs, the new
+`logger.warning`/traceback logging is what to check next.
+
 ---
 
 ## 7. Session memory

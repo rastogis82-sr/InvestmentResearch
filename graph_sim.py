@@ -70,12 +70,20 @@ def run_turn(
     safety = safety or SafetyRuntime.default()
     block = safety.gate.check(user_input, session_id, consent, stopped)
     if block is not None:
-        safety.store.append({
-            "time": datetime.now(timezone.utc).isoformat(),
-            "owner": safety.store.owner(session_id),
-            "input_classification": f"blocked:{block['reason']}",
-            "flags": [f"safety_gate_blocked:{block['reason']}"],
-        })
+        # L2's block decision itself already happened (SafetyGate.check,
+        # pure in-memory, no IO) -- logging it is bookkeeping, so a
+        # Store/SQLite failure here must not swallow the block response
+        # the caller is about to receive. See node_logic.py's
+        # update_memory_node for the identical reasoning.
+        try:
+            safety.store.append({
+                "time": datetime.now(timezone.utc).isoformat(),
+                "owner": safety.store.owner(session_id),
+                "input_classification": f"blocked:{block['reason']}",
+                "flags": [f"safety_gate_blocked:{block['reason']}"],
+            })
+        except Exception:
+            pass
         return {**state, "response": block["message"], "input_classification": f"blocked:{block['reason']}"}
 
     state = start_turn(state, user_input)

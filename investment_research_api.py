@@ -94,6 +94,14 @@ class JSONFormatter(logging.Formatter):
         for key, value in record.__dict__.items():
             if key not in logging.LogRecord.__dict__ and key not in log_entry:
                 log_entry[key] = value
+        # record.exc_info (when logger.error(..., exc_info=True) is used)
+        # is a raw (type, value, traceback) tuple -- the generic loop above
+        # would otherwise dump it as an unreadable object repr via
+        # json.dumps(default=str). Render it as actual traceback TEXT
+        # instead, so a Render Logs search for an error message actually
+        # shows what broke, not just that something did.
+        if record.exc_info:
+            log_entry["traceback"] = self.formatException(record.exc_info)
         return json.dumps(log_entry, default=str)
 
 
@@ -2973,14 +2981,26 @@ def action_preview_node(state: dict, session_id: str = "default-session", safety
     except ValueError as exc:
         return {"response": f"I can't preview that action: {exc}", "action_preview": {"error": str(exc)}}
 
-    review_id = safety.store.enqueue(session_id, f"action_preview:{preview['action']}")
+    # The dry-run preview itself (computed above) is the actual guardrail
+    # decision and must always reach the user. Logging it to the review
+    # queue is bookkeeping on top of that decision, not the decision
+    # itself — so a Store/SQLite failure here degrades to "no review id"
+    # rather than losing the preview response entirely. See
+    # human_review_gate_node's identical comment for the same reasoning.
+    try:
+        review_id = safety.store.enqueue(session_id, f"action_preview:{preview['action']}")
+        review_note = f"A human-review record was created ({review_id}); nothing proceeds without a human approving it."
+    except Exception:
+        review_id = None
+        review_note = "(A review-queue record could not be logged for this turn; the preview above is unaffected.)"
+
     lines = [
         f"Action preview — {preview['action'].replace('_', ' ')} for {preview['ticker']}",
         f"Quantity: {preview['quantity']} | Notional: ${preview['notional']:,.2f} | "
         f"Reversibility: {preview['reversibility']} | Blast radius: {preview['blast_radius']}",
         "This is a DRY RUN only — no watchlist was changed, no alert was set, no order was placed, "
         "and this sandbox has no code path that ever executes a real action.",
-        f"A human-review record was created ({review_id}); nothing proceeds without a human approving it.",
+        review_note,
     ]
     return {"response": "\n".join(lines), "action_preview": preview, "review_id": review_id}
 
@@ -3002,11 +3022,28 @@ def human_review_gate_node(state: dict, session_id: str = "default-session", saf
         return {}
     safety = safety or SafetyRuntime.default()
     reason = ",".join(f for f in flags if f.startswith(("tool_failure:", "conflicting_data:", "injection_detected", "injected_content_detected:")))
-    review_id = safety.store.enqueue(session_id, reason or "flagged")
-    response = (state.get("response") or "") + (
-        f"\n\nNote: a human-review record was created ({review_id}) because this turn involved a data "
-        "issue (see the flags above) — nothing in the answer above was withheld or changed because of it."
-    )
+    # This node only ever ADDS a note to an answer `synthesize_brief_node`
+    # already produced — it never withholds or changes it (see the
+    # module docstring above). That means a failure writing the review
+    # record (e.g. a transient SQLite error) must not turn into a lost
+    # answer / 500 for the user: it degrades to "no review id, answer
+    # unchanged" instead. This is a deliberate exception to this file's
+    # "every control fails closed" rule (see safety_layer.py's module
+    # docstring) — that rule is about SAFETY DECISIONS (consent, kill
+    # switch, injection blocking), not about this bookkeeping write.
+    try:
+        review_id = safety.store.enqueue(session_id, reason or "flagged")
+        note = (
+            f"\n\nNote: a human-review record was created ({review_id}) because this turn involved a data "
+            "issue (see the flags above) — nothing in the answer above was withheld or changed because of it."
+        )
+    except Exception:
+        review_id = None
+        note = (
+            "\n\n(This turn involved a data issue that would normally be logged for human review, but the "
+            "review-queue record could not be created this time — the answer above is unaffected.)"
+        )
+    response = (state.get("response") or "") + note
     return {"response": response, "review_id": review_id}
 
 
@@ -3035,16 +3072,21 @@ def update_memory_node(state: dict, config: dict) -> dict:
         new_entities["focus"] = state["resolved_focus"]
 
     session_id = config["configurable"]["thread_id"]
-    safety.store.append({
-        "time": datetime.now(timezone.utc).isoformat(),
-        "owner": safety.store.owner(session_id),
-        "input_classification": state.get("input_classification"),
-        "resolved_company": state.get("resolved_company"),
-        "pii_types": sorted((state.get("pii_audit") or {}).keys()),
-        "flags": state.get("flags", []),
-        "action": (state.get("action_request") or {}).get("action"),
-        "review_id": state.get("review_id"),
-    })
+    try:
+        safety.store.append({
+            "time": datetime.now(timezone.utc).isoformat(),
+            "owner": safety.store.owner(session_id),
+            "input_classification": state.get("input_classification"),
+            "resolved_company": state.get("resolved_company"),
+            "pii_types": sorted((state.get("pii_audit") or {}).keys()),
+            "flags": state.get("flags", []),
+            "action": (state.get("action_request") or {}).get("action"),
+            "review_id": state.get("review_id"),
+        })
+    except Exception as exc:
+        logger.warning("Audit-trail write failed (turn still answered)", extra={
+            "session_id": session_id, "error": str(exc),
+        })
 
     # `add_messages` (declared on ResearchState.messages) appends this single
     # new message to the persisted history — no need to rebuild the list.
@@ -3243,12 +3285,20 @@ def chat(request: ChatRequest):
 
     block = safety.gate.check(request.message, request.session_id, request.consent, request.stopped)
     if block is not None:
-        safety.store.append({
-            "time": datetime.now(timezone.utc).isoformat(),
-            "owner": safety.store.owner(request.session_id),
-            "input_classification": f"blocked:{block['reason']}",
-            "flags": [f"safety_gate_blocked:{block['reason']}"],
-        })
+        # The block decision itself (SafetyGate.check, pure in-memory) has
+        # already happened -- logging it is bookkeeping, so a Store/SQLite
+        # failure here must not turn an already-decided block into a 500.
+        try:
+            safety.store.append({
+                "time": datetime.now(timezone.utc).isoformat(),
+                "owner": safety.store.owner(request.session_id),
+                "input_classification": f"blocked:{block['reason']}",
+                "flags": [f"safety_gate_blocked:{block['reason']}"],
+            })
+        except Exception as audit_exc:
+            logger.warning("Audit-trail write failed (block still returned)", extra={
+                "session_id": request.session_id, "error": str(audit_exc),
+            })
         return ChatResponse(
             session_id=request.session_id,
             response=block["message"],
@@ -3294,7 +3344,14 @@ def chat(request: ChatRequest):
             action_preview=result.get("action_preview"),
         )
     except Exception as e:
-        logger.error("Agent invocation failed", extra={"session_id": request.session_id, "error": str(e)})
+        # exc_info=True so the FULL traceback lands in Render's logs, not
+        # just str(e) -- this is what you should grep your deploy's Logs
+        # tab for ("Agent invocation failed") if you ever see a 500 here.
+        logger.error(
+            "Agent invocation failed",
+            extra={"session_id": request.session_id, "error": str(e)},
+            exc_info=True,
+        )
         raise HTTPException(
             status_code=500,
             detail="Investment Research Assistant is temporarily unavailable. Please try again.",
