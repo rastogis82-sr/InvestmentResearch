@@ -1,0 +1,22 @@
+# streamlit_app.py runs the LangGraph-equivalent agent IN-PROCESS (unlike
+# gradio_app.py / react-ui, both thin HTTP clients against the deployed
+# investment_research_api.py service — see streamlit_app.py's module
+# docstring for why). It therefore needs the same agent-side stack as
+# requirements.txt, minus the two packages only the standalone API service
+# needs (fastapi, uvicorn), plus streamlit itself.
+streamlit>=1.40,<2
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+numpy>=1.24.0
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-community>=0.3.0
+langchain-openai>=0.2.0
+langchain-anthropic>=0.2.0
+langchain-text-splitters>=0.3.0
+langgraph>=0.2.0
+faiss-cpu>=1.8.0
+# yfinance is left UNPINNED on purpose -- see requirements.txt's identical
+# comment / yahoo_finance_market_data.py's module docstring.
+yfinance

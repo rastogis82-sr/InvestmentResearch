@@ -24,10 +24,26 @@ Reset at the start of every turn by `start_turn`:
 """
 
 import concurrent.futures
+from datetime import datetime, timezone
 from typing import Optional
 
 from guardrails import is_blank, looks_like_gibberish, detect_injection, flag_conflicting_figures
 from schemas import IntentResult, ResearchBrief
+# Guardrail layer ported from the "Week 18 — Ethics, Safety & Governance in
+# Agentic AI" notebook (as hardened in the SafeBank AI capstone built from
+# that same notebook) -- see safety_layer.py's module docstring for the
+# full mapping of each control (L1 privacy tokenization, L2 consent/kill
+# switch/rate limit, L3 injection screening, L5 human review queue, L7
+# fairness audit, L8 action allowlist) onto this agent's pipeline. L4
+# (grounding/no fabrication) and L6 (structured output) already existed
+# in this project before this guardrail pass -- see refusal_node,
+# IntentResult and ResearchBrief.
+from safety_layer import (
+    PIIMasker,
+    SafetyRuntime,
+    detect_action_request,
+    flags_warrant_review,
+)
 from tools_mock import (
     get_company_financials,
     get_stock_price,
@@ -72,6 +88,9 @@ def _resolve_any_ticker(name_or_ticker: Optional[str]) -> Optional[str]:
     return resolve_ticker_or_none(name_or_ticker) or resolve_real_ticker_or_none(name_or_ticker)
 
 
+_pii_masker = PIIMasker()  # pure regex, no I/O -- safe to construct at import time
+
+
 def _known_companies_for_prompt() -> dict:
     """Merged {ticker: name} across both universes, for intent_router's
     prompt — this is the ONLY place the LLM learns real tickers exist, so
@@ -107,6 +126,11 @@ TRANSIENT_DEFAULTS = {
     "flags": [],
     "brief": None,
     "response": None,
+    # -- guardrail-layer transient fields (see safety_layer.py) --
+    "pii_audit": {},          # PII *type* counts only, from this turn's masking -- never raw values
+    "action_request": None,  # set by input_guard when the message is an action request, not research
+    "action_preview": None,  # the ActionWhitelistGate.preview() result, if any
+    "review_id": None,       # a human-review queue id, if this turn's flags/action warranted one
 }
 
 
@@ -124,10 +148,23 @@ def start_turn(state: dict, user_input: str) -> dict:
     `session_entities` intact (that IS the session memory), and appends the
     new user message to history. This is the single point where per-turn
     state gets a clean slate — see module docstring.
+
+    L1 privacy tokenization (safety_layer.PIIMasker) happens HERE, before
+    anything else sees the raw text: `user_input`, and the copy appended to
+    `messages`, are both the MASKED text from this point on. This mirrors
+    SafeBank's chat UI, which also displays the masked text back in the
+    conversation rather than the raw original — the agent's downstream
+    logic (company/ticker resolution, the LLM calls) works identically on
+    masked text, since none of the PII patterns can match a company name
+    or ticker (see safety_layer.py's PIIMasker.patterns). Only a `pii_audit`
+    *type-count* summary is kept in state — never the real values, and
+    never persisted beyond this turn.
     """
+    masked_input, pii_map = _pii_masker.mask(user_input or "")
     state = {**state, **TRANSIENT_DEFAULTS}
-    state["user_input"] = user_input
-    state["messages"] = state["messages"] + [{"role": "user", "content": user_input}]
+    state["user_input"] = masked_input
+    state["pii_audit"] = _pii_masker.audit_summary(pii_map)
+    state["messages"] = state["messages"] + [{"role": "user", "content": masked_input}]
     return state
 
 
@@ -161,21 +198,37 @@ def input_guard(state: dict) -> dict:
         "tool_flags": [],
         "brief": None,
         "response": None,
+        "action_request": None,
+        "action_preview": None,
+        "review_id": None,
     }
 
     if is_blank(text):
         return {**reset, "input_classification": "blank", "flags": []}
 
     injection_hit = detect_injection(text)
-    if injection_hit:
+    # L3, layered: SafetyRuntime's broader, notebook-derived pattern set
+    # (system-role spoofing, encoding tricks, "don't flag this", persona
+    # override) runs in addition to the check above, which is this
+    # project's own, narrower pattern set. Either one blocks.
+    advanced_injection = SafetyRuntime.default().detector.analyse(text)
+    if injection_hit or advanced_injection["blocked"]:
+        evidence = injection_hit or ",".join(advanced_injection["signals"])
         return {
             **reset,
             "input_classification": "injection",
-            "flags": [f"injection_detected_in_input:{injection_hit!r}"],
+            "flags": [f"injection_detected_in_input:{evidence!r}"],
         }
 
     if looks_like_gibberish(text):
         return {**reset, "input_classification": "gibberish", "flags": []}
+
+    # L8 — deterministic action-request routing (see safety_layer.py's
+    # detect_action_request docstring for why this is rule-based, like
+    # blank/gibberish/injection, rather than an LLM judgment call).
+    action_request = detect_action_request(text)
+    if action_request:
+        return {**reset, "input_classification": "action_request", "action_request": action_request, "flags": []}
 
     return {**reset, "input_classification": "valid", "flags": []}
 
@@ -185,6 +238,7 @@ def route_after_input_guard(state: dict) -> str:
         "blank": "blank_node",
         "gibberish": "gibberish_node",
         "injection": "injection_node",
+        "action_request": "action_preview_node",
         "valid": "intent_router",
     }[state["input_classification"]]
 
@@ -471,6 +525,73 @@ def clarification_node(state: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Node: action_preview_node  (L8 — action allowlist + reversibility /
+# blast-radius gate, see safety_layer.ActionWhitelistGate)
+#
+# Reached only via input_guard's deterministic `action_request`
+# classification (see safety_layer.detect_action_request). Every result
+# here is a dry run: `executed` is always False, and a human-review record
+# is ALWAYS created, regardless of how low-risk the action looks — exactly
+# like SafeBank's "every account-impacting workflow requires review
+# irrespective of confidence," which is deliberately stricter than the
+# notebook's own auto-action thresholds. There is no code path anywhere in
+# this project that turns a preview into a real order, watchlist change,
+# or alert — see architecture.md's guardrail section for why that's a
+# property of the architecture (no execution adapter exists), not just a
+# promise this function keeps.
+# ---------------------------------------------------------------------------
+def action_preview_node(state: dict, session_id: str = "default-session", safety: Optional[SafetyRuntime] = None) -> dict:
+    safety = safety or SafetyRuntime.default()
+    req = state["action_request"]
+    reference = req.get("reference")
+    ticker = _resolve_any_ticker(reference) if reference else None
+    display_ticker = ticker or (reference.upper() if reference else "PORTFOLIO")
+
+    try:
+        preview = safety.action_gate.preview(
+            req["action"], display_ticker, quantity=req.get("quantity", 1) or 1, price=req.get("price", 0.0) or 0.0
+        )
+    except ValueError as exc:
+        return {"response": f"I can't preview that action: {exc}", "action_preview": {"error": str(exc)}}
+
+    review_id = safety.store.enqueue(session_id, f"action_preview:{preview['action']}")
+    lines = [
+        f"Action preview — {preview['action'].replace('_', ' ')} for {preview['ticker']}",
+        f"Quantity: {preview['quantity']} | Notional: ${preview['notional']:,.2f} | "
+        f"Reversibility: {preview['reversibility']} | Blast radius: {preview['blast_radius']}",
+        "This is a DRY RUN only — no watchlist was changed, no alert was set, no order was placed, "
+        "and this sandbox has no code path that ever executes a real action.",
+        f"A human-review record was created ({review_id}); nothing proceeds without a human approving it.",
+    ]
+    return {"response": "\n".join(lines), "action_preview": preview, "review_id": review_id}
+
+
+# ---------------------------------------------------------------------------
+# Node: human_review_gate_node  (L5 — human-in-the-loop review queue)
+#
+# Runs after reconcile_node + synthesize_brief_node on the normal research
+# path (see graph_sim.run_turn). Unlike SafeBank (where the trigger is the
+# banking INTENT itself), this agent has no intent that is inherently
+# high-risk, so the trigger is the same flags the rest of the pipeline
+# already raises for other reasons — see safety_layer.flags_warrant_review.
+# A flagged turn still gets its normal answer; this only ADDS a queued
+# record for a human to double-check, it never withholds the response.
+# ---------------------------------------------------------------------------
+def human_review_gate_node(state: dict, session_id: str = "default-session", safety: Optional[SafetyRuntime] = None) -> dict:
+    flags = state.get("flags", [])
+    if not flags_warrant_review(flags):
+        return {}
+    safety = safety or SafetyRuntime.default()
+    reason = ",".join(f for f in flags if f.startswith(("tool_failure:", "conflicting_data:", "injection_detected", "injected_content_detected:")))
+    review_id = safety.store.enqueue(session_id, reason or "flagged")
+    response = (state.get("response") or "") + (
+        f"\n\nNote: a human-review record was created ({review_id}) because this turn involved a data "
+        "issue (see the flags above) — nothing in the answer above was withheld or changed because of it."
+    )
+    return {"response": response, "review_id": review_id}
+
+
+# ---------------------------------------------------------------------------
 # Node: update_memory_node  (runs at the end of every path)
 #
 # NOTE: this version manually appends a plain dict to a plain Python list,
@@ -480,7 +601,7 @@ def clarification_node(state: dict) -> dict:
 # `add_messages` reducer append it — see architecture.md Section 4 — rather
 # than reconstructing the whole list by hand, which is what a reducer is for.
 # ---------------------------------------------------------------------------
-def update_memory_node(state: dict) -> dict:
+def update_memory_node(state: dict, session_id: str = "default-session", safety: Optional[SafetyRuntime] = None) -> dict:
     new_entities = dict(state.get("session_entities", {"company": None, "focus": None}))
     if state["resolved_company"]:
         new_entities["company"] = state["resolved_company"]
@@ -488,4 +609,23 @@ def update_memory_node(state: dict) -> dict:
         new_entities["focus"] = state["resolved_focus"]
 
     messages = state["messages"] + [{"role": "assistant", "content": state["response"]}]
+
+    # L_audit — one HMAC-chained, metadata-only record per turn (see
+    # safety_layer.Store). Never the raw question/answer text or a PII
+    # value: only classification, flags, PII *type* counts, and any
+    # review id. Runs on EVERY path (this node is the universal sink —
+    # see this function's position in graph_sim.run_turn), so a
+    # blank/gibberish/injection/action-request turn is audited exactly
+    # like a normal research turn.
+    safety = safety or SafetyRuntime.default()
+    safety.store.append({
+        "time": datetime.now(timezone.utc).isoformat(),
+        "owner": safety.store.owner(session_id),
+        "input_classification": state.get("input_classification"),
+        "resolved_company": state.get("resolved_company"),
+        "pii_types": sorted((state.get("pii_audit") or {}).keys()),
+        "flags": state.get("flags", []),
+        "action": (state.get("action_request") or {}).get("action"),
+        "review_id": state.get("review_id"),
+    })
     return {"session_entities": new_entities, "messages": messages}

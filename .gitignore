@@ -15,3 +15,7 @@ venv/
 
 # Local scratch
 *.log
+
+# Guardrail layer's local audit DB + signing key (see safety_layer.py) —
+# metadata/audit state, never committed, same reasoning as .env.
+data/

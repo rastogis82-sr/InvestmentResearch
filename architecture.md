@@ -31,6 +31,11 @@ rather than live, changing search results).
 **UI: Gradio**, not Streamlit — chosen for lower-friction Colab embedding
 (`demo.launch(share=True)` produces a public URL immediately, no separate
 hosting step) and a natural two-column chat-plus-transparency-panel layout.
+(A Streamlit UI was added later, alongside Gradio rather than in place of
+it — see Section 6b/9g. It exists specifically to give the ported
+guardrail layer its own interactive control surface — a review queue,
+a safety-feature playground, a governance tab — rather than to replace
+Gradio as the primary chat UI.)
 
 ---
 
@@ -415,6 +420,98 @@ classifier, output-side verification).
 
 ---
 
+## 6b. Guardrail layer — Ethics, Safety & Governance (ported from Week 18 / SafeBank AI)
+
+Section 6 above covers this project's **original** guardrails (blank/
+gibberish/injection/fabrication/tool-failure/RAG-failure/conflicting-data).
+A second, independent guardrail layer — `safety_layer.py` — was added
+later, **ported** from the Week 18 "Ethics, Safety & Governance in Agentic
+AI" notebook as already implemented and hardened in a separate BFSI
+capstone project (SafeBank AI), then adapted from SafeBank's banking
+domain (loans, KYC, fraud, trade finance) to this project's research
+domain. It is additive, not a replacement: every check in Section 6 still
+runs exactly as before; `safety_layer.py` adds eight further layers on
+top, each independently testable (`test_safety_layer.py`, 56 checks) and
+independently disableable by simply not calling it, rather than being
+fused into the existing guardrail functions.
+
+| Layer | What it does | Where |
+|---|---|---|
+| L1 — Privacy / PII masking | Regex-based detection and reversible tokenization (`[[EMAIL_xxxx]]`, `[[PAN_xxxx]]`, etc.) of emails, card/account numbers, IFSC/IBAN codes, phone numbers, names, addresses, passport numbers, and anything following a "secret"/"password" cue — masked *before* the text reaches the LLM or any log/audit record. | `PIIMasker` — called in `node_logic.start_turn` (local simulation) and explicitly at both real entry points, `investment_research_api.py`'s `/chat` and the notebook's `chat()` helper (see "three execution paths," below). |
+| L2 — Input guardrails | Consent flag, kill-switch flag, per-session rate limit (12 requests / 60s), and a hard input-size bound (4000 chars) — checked *before* any masking, routing, or LLM call. | `SafetyGate.check()` — first thing `graph_sim.run_turn` does; first thing the `/chat` endpoint and notebook `chat()` do. |
+| L3 — Prompt-injection screening (advanced) | A second, independent injection detector layered on top of Section 6's existing `_INJECTION_RE` prefilter: 9 broader regex signals (role-override phrasing, "ignore previous instructions," delimiter-escape attempts, etc.) plus Unicode `NFKC` normalization so a formatting-character-obfuscated injection (zero-width joiners, etc.) can't slip past either detector. | `PromptInjectionDetector.analyse()` — called inside `input_guard`, alongside (not instead of) the original regex. |
+| L4 — Grounding / no-fabrication | Unchanged from Section 6 — the `ResearchBrief` schema's bucketed-fields contract is the existing control; this layer is called out here only because the Week 18 notebook treats it as a named layer. | `synthesize_brief_node` (unchanged). |
+| L5 — Human-in-the-loop review queue | Any turn carrying a `tool_failure:`, `conflicting_data:`, or injection-related flag — or any dry-run action preview (L8) — is enqueued as a `PENDING` review record with a generated `REVIEW-xxxxxxxxxxxx` id, surfaced to the end user in-chat and listable/actionable via the Streamlit UI's Review Queue tab or the API's `/review/{session_id}` endpoints. Approval/rejection here is always simulated (`SIMULATED_APPROVED`/`SIMULATED_REJECTED`) — nothing downstream is actually gated on it, consistent with this project's "no real financial action" rule. | `human_review_gate_node`, `action_preview_node`, `Store.enqueue`/`Store.queue`/`Store.review`. |
+| L6 — Structured output validation | Unchanged from Section 6 — Pydantic schemas (`IntentResult`, `ResearchBrief`) are the existing control. | (unchanged). |
+| L7 — Bias / fairness screening | A standalone `fairness_audit()` utility computing per-group selection rates and the 80%-rule disparate-impact ratio over a set of outcome rows, flagging `review_flag=True` below that threshold. **Not auto-wired into the chat turn** (there is no protected-attribute data in this project's domain to screen against) — exposed instead as an explicit, documented tool in the Streamlit UI's Safety Lab tab, matching how the source notebook/SafeBank AI itself treats it as an on-demand governance check rather than a per-request gate. | `fairness_audit()` in `safety_layer.py`. |
+| L8 — Action allowlist + reversibility/blast-radius gate | Detects a request to take a concrete action (watchlist add/remove, price alert, portfolio-review scheduling, a trade-order *preview*) via `detect_action_request()`, then validates it against a fixed allowlist with per-action reversibility (`FULL`/`PARTIAL`/`NONE`) and blast-radius (`LOW`/`MEDIUM`/`HIGH`) metadata, quantity/price/notional bounds, and — critically — always returns `"dry_run": True, "human_required": True, "executed": False`. **No action is ever executed**; this mirrors the project's pre-existing architectural guarantee (the mock tools were always read-only) and extends it explicitly to this new action-request surface. | `ActionWhitelistGate.preview()`, `detect_action_request()`, `action_preview_node`. |
+| Audit trail (cross-cutting) | Every turn appends one record (timestamp, a session-scoped HMAC "owner" id rather than the raw session id, input classification, resolved company, PII-type counts only — never masked values, flags, action taken, review id) to a SQLite log, each record's signature computed over the previous record's signature — an HMAC hash chain, so any single edited/deleted row breaks `Store.verify()` for every record after it. Exposed via `GET /audit/verify` and the Streamlit Governance tab's export button. | `Store.append()`/`Store.verify()` in `safety_layer.py`; called from `update_memory_node`. |
+
+**Domain adaptation from SafeBank AI.** SafeBank's guardrail layer gates
+real banking actions (loan approval, KYC decisions, fraud holds, trade-
+finance instructions) with real stakes. This project has no such actions
+at all — every "tool" was already a read-only mock lookup. Rather than
+invent fake real actions just to exercise L8, the five actions it
+recognizes (`add_to_watchlist`, `remove_from_watchlist`, `set_price_alert`,
+`schedule_portfolio_review`, `generate_trade_order_preview`) were chosen
+specifically because they're the closest thing this domain has to an
+"action," and every one of them is explicitly a **preview only** —
+`generate_trade_order_preview` in particular previews what a trade order
+*would* look like (ticker, quantity, notional) without ever placing one,
+keeping faith with this project's "never fabricate, never actually act"
+contract while still giving the allowlist/reversibility/blast-radius gate
+something real to evaluate.
+
+**Why this had to be wired into three separate execution paths.** This
+project maintains three parallel implementations of the same node logic
+(see Sections 2, 8, 9): the dependency-free local simulation
+(`node_logic.py` + `graph_sim.py`), the real FastAPI service
+(auto-generated `investment_research_api.py`), and the real Colab notebook
+(auto-generated `Investment_Research_Assistant.ipynb`). All three had to
+be updated to stay behaviorally identical, and two non-obvious asymmetries
+came up doing it:
+
+- **Where PII masking actually happens.** `node_logic.start_turn()` masks
+  the local simulation's input — but the real LangGraph app (both the
+  `/chat` endpoint and the notebook's `chat()` helper) never calls
+  `start_turn` at all; LangGraph's initial invoke state is built directly
+  at the `.invoke()` call site. Masking only inside `start_turn` would
+  have silently left the real deployed API/notebook completely unmasked.
+  Both real entry points now call `safety.masker.mask(...)` explicitly,
+  before constructing the initial state, and pass the resulting
+  `pii_audit` summary through as part of it.
+- **The `.replace()`-based code-generation pattern.** `build_api_app.py`
+  and `assemble_notebook.py` both take `node_logic.py`'s real source and
+  use an *exact-string* `.replace()` to swap its local-simulation
+  `update_memory_node` (plain dict/list, no LangGraph dependency) for a
+  LangGraph-real version (`(state, config)` signature, returns
+  `{"messages": [AIMessage(...)]}` for the `add_messages` reducer). This
+  is a sharp edge: if `update_memory_node`'s signature or body changes and
+  the `.replace()` old-string isn't updated to match, `str.replace`
+  returns the string **unchanged with no error** — silently embedding the
+  wrong, non-LangGraph-compatible version into the generated API/notebook.
+  Adding the `session_id`/`safety`/audit-append logic to
+  `update_memory_node` required updating both `.replace()` calls' old- and
+  new-strings in lockstep; this is now called out here explicitly as a
+  standing hazard for any future change to that function.
+
+**Honest limitations**, in the same spirit as the Honest Limitations
+elsewhere in this document: PII detection is regex-based, not a trained
+NER model, so it will miss unusual formats and can over- or under-match
+edge cases. The audit hash chain detects tampering with any *recorded*
+entry, but can't detect an entire run's log being deleted and never
+written in the first place. Session ids are not authenticated identities
+— the HMAC "owner" id only prevents a *different* session from reading or
+reviewing another session's queue items, not sessions being spoofed.
+Fairness screening (L7) is available as a tool, not auto-wired into every
+turn, because this domain's chat turns carry no protected-attribute data
+to screen in the first place. None of L5/L8's "approve"/"execute" actions
+are real — this layer governs a chat agent that was already read-only;
+it does not add safety controls to real banking actions the way SafeBank
+AI's original implementation does.
+
+---
+
 ## 7. Session memory
 
 `MemorySaver` (LangGraph's in-process checkpointer) persists `messages`
@@ -450,6 +547,22 @@ and the notebook) were then ported into the real LangGraph `StateGraph` in
 test-harness cell run against the real compiled graph (free and offline
 with `MOCK_LLM = True`, or against a real provider with `MOCK_LLM =
 False`).
+
+**Guardrail layer (Section 6b) testing.** `safety_layer.py`'s eight layers
+have their own 56-check suite, `test_safety_layer.py`, covering each class
+in isolation (`PIIMasker` mask/unmask roundtrips and no-false-positive
+cases, `PromptInjectionDetector` on direct/clean/Unicode-obfuscated input,
+`SafetyGate`'s kill-switch/consent/blank/oversized/rate-limit paths,
+`Store`'s append/enqueue/queue/review/replay-prevention/cross-session-
+rejection/tamper-detection via a raw SQL edit, `ActionWhitelistGate`'s
+dry-run/bounds/non-allowlisted cases, `detect_action_request`,
+`flags_warrant_review`, `fairness_audit`, and the `SafetyRuntime.default()`
+singleton) plus 5 end-to-end checks that drive the whole layer through
+`graph_sim.run_turn` exactly as a real turn would. Combined with the project's pre-existing 122-check suite (which includes
+`test_harness.py`'s 23), the full local test count is **178/178 passing**
+(122 + `test_safety_layer.py`'s 56) — rerun in full after every change
+described in Section 6b, including after the auto-assembly and
+documentation updates.
 
 ---
 
@@ -536,6 +649,7 @@ NGROK_AUTH_TOKEN=your_ngrok_token_here
 | `TWELVEDATA_API_KEY` | unset | Optional. Enables real-company (AAPL/MSFT/GOOGL/AMZN/TSLA/NVDA) market data via Twelve Data — see Section 5b. Unset or missing just makes real-company tool calls fail cleanly (`missing_twelvedata_api_key`); the synthetic ABC/XYZ/DEF universe is unaffected either way. |
 | `TWELVEDATA_CACHE_TTL_SECONDS` | `"30"` | How long a Twelve Data response is cached in memory before a repeat call re-hits the network — see Section 9b. Set to `"0"` to disable caching entirely. |
 | `YAHOO_FINANCE_CACHE_TTL_SECONDS` | `"30"` | Same purpose as `TWELVEDATA_CACHE_TTL_SECONDS`, for Yahoo Finance's response cache — see Section 5c. No API key variable exists for Yahoo Finance at all; it needs none. |
+| `SAFETY_AUDIT_DB_PATH` | `"data/safety_audit.db"` | Path to the guardrail layer's SQLite audit trail + human-review queue — see Section 6b. The directory is created automatically; the file is excluded via `.gitignore`'s `data/` entry, same reasoning as `.env`. `streamlit_app.py` reads the same variable so both UIs/the API share one audit trail when pointed at the same path. |
 
 ### Endpoints
 
@@ -554,6 +668,14 @@ NGROK_AUTH_TOKEN=your_ngrok_token_here
   equivalent of the Gradio UI's transparency panel. **Deliberately left
   unauthenticated**, which is acceptable only because it sits behind a
   private, short-lived ngrok URL for a classroom demo (see Limitations).
+- `GET /review/{session_id}` — lists that session's human-review queue
+  items (Section 6b, L5) — id, reason, status, created-at.
+- `POST /review/{session_id}/{review_id}` — `{"outcome": "approve"|
+  "reject"}` → records a **simulated** review decision
+  (`SIMULATED_APPROVED`/`SIMULATED_REJECTED`) against that queue item.
+  Nothing downstream is actually gated on this; see Section 6b.
+- `GET /audit/verify` — `{"verified": bool}`, re-walks the HMAC audit-log
+  hash chain (Section 6b) and reports whether it's intact.
 
 ### Operational details
 
@@ -1125,6 +1247,74 @@ Render deploy, for the same reason 9e asks you to `docker compose up
 --build` locally first. Otherwise, the same limitations as 9d apply: no
 authentication, and a cold-started API can still take 30-60s to answer
 the first request after this page itself has already loaded instantly.
+
+---
+
+## 9g. Streamlit frontend — guardrail-layer control surface
+
+A fifth frontend, but architecturally unlike 9d/9f: `gradio_app.py` and
+`react-ui/` are thin HTTP clients against the *deployed* API; the three
+earlier UIs exist to showcase the original chat/research functionality.
+`streamlit_app.py` was built specifically to give Section 6b's guardrail
+layer its own interactive surface — a review queue, a guardrail
+"playground," an audit export — and showcasing that well meant driving
+the agent **in-process**, the same way SafeBank AI's own UI does, rather
+than adding yet more HTTP endpoints just to expose internal safety state
+that was never meant to be public API surface in the first place.
+
+**Kept alongside Gradio, not instead of it.** `gradio_app.py` is
+untouched — both UIs stay deployed; `streamlit_app.py` is purely additive.
+(The user explicitly green-lit falling back to Gradio-only if Streamlit
+proved difficult; it didn't, so both ship.)
+
+**In-process, not an HTTP client.** `@st.cache_resource` builds the same
+agent components `investment_research_api.py` builds — `MockChatModel` +
+`LocalKeywordRetriever` when `MOCK_LLM` is true, else the real
+LangChain/FAISS stack — and a `SafetyRuntime(store=Store(
+SAFETY_AUDIT_DB_PATH))`, then calls `graph_sim.run_turn(...)` directly.
+This means `streamlit_app.py` needs the full agent-side dependency stack
+(`requirements-streamlit.txt`, a copy of `requirements.txt` minus
+`fastapi`/`uvicorn` plus `streamlit` itself) — unlike `gradio_app.py`,
+which needs almost none of it.
+
+**Four tabs:**
+
+- **Assistant** — the primary chat, two columns: the conversation on the
+  left (consent checkbox and kill-switch toggle in the sidebar feed
+  straight into L2's `SafetyGate.check()`), and on the right a static list
+  of all 8 guardrail layers plus example prompts designed to trip each one
+  (an injection phrase, a PII-bearing question, an action request). Each
+  turn's full decision trace (classification, flags, PII-audit counts,
+  action preview, review id) is available under an "Inspect latest
+  decision trace" expander — `st.json` on the same dict the API's
+  `/debug/{session_id}` returns, just rendered in-page instead of over
+  HTTP.
+- **Review queue** — lists the current session's pending items
+  (`safety.store.queue(session_id)`) with per-item "Simulate approval" /
+  "Simulate rejection" buttons — the interactive equivalent of
+  `POST /review/{session_id}/{review_id}`.
+- **Safety lab** — a hands-on playground for each layer in isolation,
+  independent of the chat flow: a PII mask/unmask demo, an injection-
+  analysis demo (`PromptInjectionDetector.analyse()` on arbitrary text), an
+  action-preview form (pick an action/ticker/quantity/price, see
+  `ActionWhitelistGate.preview()`'s exact dry-run output), and a
+  fairness-audit panel that takes a pasted JSON array of outcome rows and
+  runs `fairness_audit()` against it.
+- **Governance** — a written explanation of all 8 layers with the Week 18
+  notebook / SafeBank AI citation, the same honest-limitations list as
+  Section 6b, and a `st.download_button` that exports the current
+  session's full audit trail (`safety.store.export_for_session(...)`) as
+  JSON — a lightweight stand-in for a real compliance export.
+
+**Honest limitation**: this sandbox cannot install `streamlit` (same
+network restriction documented throughout this file for other packages),
+so `streamlit_app.py` was verified with `python3 -m py_compile` for
+syntax only, never run live — run it locally with
+`pip install -r requirements-streamlit.txt && streamlit run
+streamlit_app.py` to try it. Like the other UIs, it has no authentication
+of its own; unlike them, it's meant for local/demo use (showing the
+guardrail internals) rather than as a second public-facing deployment, so
+no Render service block was added for it.
 
 ---
 

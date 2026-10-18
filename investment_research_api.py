@@ -45,6 +45,11 @@ Configuration (environment variables, all optional with sane defaults):
     company profile and real financial-statement data that Twelve Data's
     free plan can't provide at all, independent of whether
     TWELVEDATA_API_KEY is set; ABC/XYZ/DEF are unaffected either way.)
+    SAFETY_AUDIT_DB_PATH Optional, default "data/safety_audit.db". The
+                        guardrail layer's tamper-evident audit log +
+                        human-review queue (see safety_layer.py) -- a
+                        local SQLite file; never raw question/answer
+                        text or a PII value, only metadata.
 
 All of the above are read from the process environment — never
 hardcoded in this file. Locally (or in Vocareum), copy `.env.example` to
@@ -1290,6 +1295,533 @@ def flag_conflicting_figures(doc_text: str, tool_value: float, tolerance_pct: fl
 
 
 # =============================================================================
+# Guardrail layer ported from the Week 18 Ethics/Safety/Governance notebook
+# (as hardened in the SafeBank AI capstone) — identical to safety_layer.py.
+# node_logic.py below imports from this module, so it must be defined
+# first. See safety_layer.py's module docstring and architecture.md's
+# guardrail section for the full mapping onto this agent's pipeline.
+# =============================================================================
+"""
+safety_layer.py
+----------------
+Agentic-AI guardrails ported from the "Week 18 — Ethics, Safety & Governance
+in Agentic AI" notebook, as implemented and hardened in the SafeBank AI
+capstone (a separate BFSI assistant built from the same notebook). This
+module re-implements the SAME eight controls for the Investment Research
+Assistant's domain, rather than reusing the banking-specific module
+directly, because the specifics differ (investment-research actions
+instead of account/loan/KYC actions; no banking POLICIES dict, since this
+agent already grounds itself in RAG + live tool data, not canned policy
+text) even though the *shape* of each control is identical.
+
+The eight controls, and where each one plugs into node_logic.py's existing
+pipeline (see node_logic.py's module docstring for the pipeline itself):
+
+  L1  Privacy tokenization      PIIMasker            -- runs in input_guard,
+                                                          before anything is
+                                                          stored in session
+                                                          memory or sent to
+                                                          an LLM
+  L2  Input guardrails          consent/kill-switch/   -- SafetyGate.check(),
+                                 rate limit/size bound     the very first
+                                                           call on every turn
+  L3  Prompt-injection screening PromptInjectionDetector -- direct input AND
+                                                          retrieved RAG
+                                                          chunks (defense in
+                                                          depth alongside
+                                                          guardrails.py's
+                                                          existing
+                                                          detect_injection)
+  L4  Grounding / no fabrication (already existed: refusal_node,
+                                  ResearchBrief's assumptions/limitations
+                                  fields) -- unchanged, just now also
+                                  audited
+  L5  Human-in-the-loop review  Store.enqueue()/.review() -- triggered for
+                                                          high-risk turns
+                                                          (conflicting data,
+                                                          tool failure on a
+                                                          real company, or an
+                                                          action preview)
+  L6  Structured output          (already existed: IntentResult,
+      validation                 ResearchBrief) -- unchanged
+  L7  Bias / fairness screening fairness_audit()    -- standalone utility,
+                                                        exposed in the
+                                                        Streamlit "Safety
+                                                        lab" tab, same as
+                                                        SafeBank (not wired
+                                                        into the main
+                                                        pipeline — there is
+                                                        no selection
+                                                        decision in THIS
+                                                        agent to audit
+                                                        automatically)
+  L8  Action allowlist +        ActionWhitelistGate  -- a NEW node,
+      reversibility/blast-radius                        action_preview_node,
+      gate                                              for bounded,
+                                                          dry-run-only
+                                                          research actions
+                                                          (add to watchlist,
+                                                          set a price alert)
+                                                          -- never a real
+                                                          trade or account
+                                                          action, matching
+                                                          this project's
+                                                          existing "no real
+                                                          financial
+                                                          execution" rule
+
+Every control below fails closed: on any internal error, the safe
+behaviour is to block/refuse, never to silently proceed.
+"""
+
+import hashlib
+import hmac
+import json
+import re
+import secrets
+import sqlite3
+import threading
+import time
+import unicodedata
+from collections import deque
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Text normalization (defeats a common injection obfuscation: Unicode
+# format-control characters, e.g. zero-width characters, spliced into
+# "ig​nore your instructions" to dodge a naive substring match)
+# ---------------------------------------------------------------------------
+def normalize(text: str) -> str:
+    return "".join(
+        c for c in unicodedata.normalize("NFKC", text or "")
+        if unicodedata.category(c) != "Cf"
+    )
+
+
+# ---------------------------------------------------------------------------
+# L1 — Privacy tokenization
+# ---------------------------------------------------------------------------
+class PIIMasker:
+    """Detects and reversibly tokenizes PII/secrets in free text BEFORE it
+    is stored in session memory or sent to an LLM. Reused verbatim from the
+    banking-domain version: investment-research queries are not expected
+    to carry customer PII, but a user pasting a personal email, phone
+    number, or a stray OTP/password into a research question is exactly
+    the kind of accidental-leak case this control exists for — the same
+    reasoning as the notebook's Samsung-engineers incident (UC1), just one
+    step removed from the obvious banking case.
+
+    Masking is NEVER automatically reversed in logs or the audit trail —
+    `unmask()` exists only so the chat UI can show a user's own message
+    back to them with their own data intact, never for any stored record.
+    """
+
+    patterns = [
+        ("SECRET", r"\b(?:sk-[A-Za-z0-9_-]{8,}|(?:otp|pin|password|cvv)\s*[:=]?\s*\S+)"),
+        ("EMAIL", r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b"),
+        ("PAN", r"\b[A-Z]{5}\d{4}[A-Z]\b"),
+        ("IFSC", r"\b[A-Z]{4}0[A-Z0-9]{6}\b"),
+        ("IBAN", r"\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]){11,30}\b"),
+        ("NUMBER", r"(?<!\w)\+?\d[\d -]{8,24}\d(?!\w)"),
+        ("NAME", r"(?i)(?<=name:)\s*[A-Za-z]+(?: [A-Za-z]+){0,3}"),
+        ("ADDRESS", r"(?i)(?<=address:)\s*[^\n;]+"),
+        ("PASSPORT", r"\b[A-Z]\d{7}\b"),
+    ]
+
+    def mask(self, text: str) -> tuple[str, dict]:
+        mapping: dict = {}
+        for kind, pattern in self.patterns:
+            def replace(match):
+                token = f"[{kind}_{len(mapping) + 1}]"
+                mapping[token] = match.group()
+                return token
+            text = re.sub(pattern, replace, text or "")
+        return text, mapping
+
+    def unmask(self, text: str, mapping: dict) -> str:
+        for token, value in mapping.items():
+            text = text.replace(token, value)
+        return text
+
+    def audit_summary(self, mapping: dict) -> dict:
+        """GDPR/DPDP-safe summary: PII *types* and counts only, never the
+        actual values. This, never `mapping` itself, is what goes in the
+        audit trail."""
+        summary: dict = {}
+        for token in mapping:
+            kind = token.strip("[]").rsplit("_", 1)[0]
+            summary[kind] = summary.get(kind, 0) + 1
+        return summary
+
+
+# ---------------------------------------------------------------------------
+# L3 — Prompt-injection screening (direct input + retrieved content)
+# ---------------------------------------------------------------------------
+class PromptInjectionDetector:
+    """A second, independent injection screen layered on top of
+    guardrails.py's existing `detect_injection` (which still runs, for
+    input_guard and for every RAG chunk — see node_logic.py). That one is
+    pattern-matched for this project's specific threat ("tell me to
+    recommend a stock"); this one is the broader, notebook-derived
+    pattern set (system-role spoofing, encoding tricks, "don't flag
+    this", persona override) plus a 0..1 severity score and named evidence
+    codes for the audit trail, rather than a plain True/False.
+    """
+
+    patterns = [
+        r"ignore.{0,35}(instructions|rules|previous)",
+        r"(reveal|print|show|output).{0,30}(system prompt|secret|instructions)",
+        r"(system|developer)\s*:",
+        r"\[/?INST\]|<\|.*?\|>",
+        r"(bypass|disable|override).{0,30}(guard|safety|approval|policy)",
+        r"(automatically|immediately|auto).{0,20}approve|approve.{0,30}immediately",
+        r"base64|rot13|hex.encoded",
+        r"do not.{0,15}(flag|escalate|review)",
+        r"forget.{0,20}(rules|training)|new persona",
+    ]
+
+    def analyse(self, text: str) -> dict:
+        hits = [f"signal-{i + 1}" for i, p in enumerate(self.patterns)
+                if re.search(p, normalize(text), re.I | re.S)]
+        return {"score": min(1.0, 0.8 * len(hits)), "signals": hits, "blocked": bool(hits)}
+
+
+# ---------------------------------------------------------------------------
+# L2 — Consent, kill switch, rate limiting, size bounds
+# ---------------------------------------------------------------------------
+class SafetyGate:
+    """The first check on every turn, before input_guard even runs.
+    Mirrors SafeBank's `if stopped / if not consent / if too long / rate
+    limit` block. `check()` returns `None` when the turn may proceed, or a
+    dict describing the block (so node_logic/the UI can render a clear
+    refusal) when it may not.
+    """
+
+    MAX_INPUT_CHARS = 4000
+    MAX_WINDOW_SECONDS = 60
+    MAX_REQUESTS_PER_WINDOW = 12
+
+    def __init__(self):
+        self._requests: dict[str, deque] = {}
+        self._lock = threading.Lock()
+
+    def check(self, text: str, session_key: str, consent: bool, stopped: bool) -> Optional[dict]:
+        if stopped:
+            return {"reason": "kill_switch", "message": "The session kill switch is active."}
+        if not consent:
+            return {"reason": "no_consent", "message": "Accept the processing notice before using this assistant."}
+        if not isinstance(text, str) or not text.strip():
+            return {"reason": "blank", "message": "I didn't receive a question."}
+        if len(text) > self.MAX_INPUT_CHARS:
+            return {
+                "reason": "too_long",
+                "message": f"Message exceeds {self.MAX_INPUT_CHARS:,} characters. Please shorten your question.",
+            }
+        with self._lock:
+            now = time.monotonic()
+            window = self._requests.setdefault(session_key, deque())
+            while window and window[0] <= now - self.MAX_WINDOW_SECONDS:
+                window.popleft()
+            if len(window) >= self.MAX_REQUESTS_PER_WINDOW:
+                return {"reason": "rate_limited", "message": "Rate limit reached. Try again in a minute."}
+            window.append(now)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# L5 — Human-in-the-loop review queue, L_audit — tamper-evident audit trail
+# ---------------------------------------------------------------------------
+class Store:
+    """Metadata-only SQLite review queue + HMAC-chained audit log, ported
+    verbatim from SafeBank's `Store` (same reasoning: the signing key never
+    leaves local storage, and the chain detects any edit to a past record
+    as long as the key itself isn't compromised — see SafeBank's
+    docs/SECURITY.md for the documented limits of this approach, which
+    apply identically here: it cannot detect deletion of a whole trailing
+    slice without an external checkpoint, and is not WORM/immutable
+    storage).
+
+    Audit records here are metadata only — PII type counts from
+    `PIIMasker.audit_summary`, injection evidence codes, flags, confidence
+    — never the raw question text or any unmasked PII value.
+    """
+
+    def __init__(self, path: str = "data/safety_audit.db"):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        keyfile = Path(path).with_suffix(".key")
+        try:
+            with keyfile.open("xb") as f:
+                f.write(secrets.token_bytes(32))
+        except FileExistsError:
+            pass
+        self.key = keyfile.read_bytes()
+        with self.db() as db:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS audit (seq INTEGER PRIMARY KEY, payload TEXT NOT NULL, signature TEXT NOT NULL)"
+            )
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS queue (id TEXT PRIMARY KEY, owner TEXT NOT NULL, reason TEXT NOT NULL, status TEXT NOT NULL, created REAL NOT NULL)"
+            )
+
+    @contextmanager
+    def db(self):
+        connection = sqlite3.connect(self.path, timeout=10)
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
+    def owner(self, session: str) -> str:
+        return hmac.new(self.key, session.encode(), hashlib.sha256).hexdigest()
+
+    def append(self, event: dict) -> None:
+        payload = json.dumps(event, sort_keys=True)
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT signature FROM audit ORDER BY seq DESC LIMIT 1").fetchone()
+            previous = row[0] if row else ""
+            sig = hmac.new(self.key, (previous + payload).encode(), hashlib.sha256).hexdigest()
+            db.execute("INSERT INTO audit(payload, signature) VALUES (?, ?)", (payload, sig))
+
+    def verify(self) -> bool:
+        previous = ""
+        with self.db() as db:
+            for payload, sig in db.execute("SELECT payload, signature FROM audit ORDER BY seq"):
+                expected = hmac.new(self.key, (previous + payload).encode(), hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(expected, sig):
+                    return False
+                previous = sig
+        return True
+
+    def export_for_session(self, session: str) -> list[dict]:
+        """All audit records whose `owner` matches this session's HMAC —
+        used only for the Streamlit UI's "export session audit" download,
+        never to reconstruct anything from the chain itself."""
+        owner = self.owner(session)
+        out = []
+        with self.db() as db:
+            for (payload,) in db.execute("SELECT payload FROM audit ORDER BY seq"):
+                event = json.loads(payload)
+                if event.get("owner") == owner:
+                    out.append(event)
+        return out
+
+    def enqueue(self, session: str, reason: str) -> str:
+        ident = "REVIEW-" + secrets.token_hex(6).upper()
+        with self.db() as db:
+            db.execute(
+                "INSERT INTO queue VALUES (?, ?, ?, ?, ?)",
+                (ident, self.owner(session), reason, "PENDING", time.time()),
+            )
+        return ident
+
+    def queue(self, session: str) -> list[dict]:
+        with self.db() as db:
+            return [
+                dict(zip(("id", "reason", "status", "created"), r))
+                for r in db.execute(
+                    "SELECT id, reason, status, created FROM queue WHERE owner=?", (self.owner(session),)
+                )
+            ]
+
+    def review(self, session: str, ident: str, outcome: str) -> None:
+        if outcome not in ("SIMULATED_APPROVED", "SIMULATED_REJECTED"):
+            raise ValueError("Invalid outcome")
+        with self.db() as db:
+            changed = db.execute(
+                "UPDATE queue SET status=? WHERE id=? AND owner=? AND status='PENDING'",
+                (outcome, ident, self.owner(session)),
+            ).rowcount
+        if not changed:
+            raise ValueError("Review unavailable or already resolved")
+        self.append({"event": "simulated_review", "owner": self.owner(session), "id": ident, "outcome": outcome})
+
+
+# High-risk flags (produced elsewhere in node_logic.py's `flags`/
+# `tool_flags`/`rag_flags`, see that module) that route a turn to the
+# human-review queue rather than only being shown inline. Unlike SafeBank
+# (where the trigger is the banking INTENT itself — fraud/loan/KYC/...),
+# this agent has no analogous "intent" that is inherently high-risk; what
+# makes a research turn worth a human look is the SAME signal the rest of
+# the pipeline already flags: a tool failed, a source conflicted with
+# live data, or the agent refused a fabrication request.
+REVIEW_WORTHY_FLAG_PREFIXES = ("tool_failure:", "conflicting_data:", "injection_detected", "injected_content_detected:")
+
+
+def flags_warrant_review(flags: list[str]) -> bool:
+    return any(f.startswith(p) for f in (flags or []) for p in REVIEW_WORTHY_FLAG_PREFIXES)
+
+
+# ---------------------------------------------------------------------------
+# L8 — Action allowlist + reversibility / blast-radius gate
+# ---------------------------------------------------------------------------
+class ActionWhitelistGate:
+    """Preview-only, exactly like SafeBank's gate for trade orders: no
+    route exists anywhere in this codebase for the agent to actually place
+    a trade, move money, or touch a real account. The allowlisted actions
+    here are the research-assistant equivalent of SafeBank's banking
+    actions — bounded, reversible, and always returned as a dry-run
+    preview with `executed: False`.
+
+    reversibility: 'FULL' (undo any time), 'PARTIAL' (undo with some
+    friction, e.g. a scheduled reminder you have to re-cancel),
+    'NONE' (the gate still only PREVIEWS it — this project never executes
+    anything — but a real trade-order action would not be undoable once
+    filled, so it's labeled NONE/HIGH to make that risk visible even in a
+    sandbox preview).
+    """
+
+    allowed = {
+        "add_to_watchlist": ("FULL", "LOW"),
+        "remove_from_watchlist": ("FULL", "LOW"),
+        "set_price_alert": ("FULL", "LOW"),
+        "schedule_portfolio_review": ("PARTIAL", "MEDIUM"),
+        "generate_trade_order_preview": ("NONE", "HIGH"),
+    }
+
+    MAX_QUANTITY = 10_000
+    MAX_PRICE = 1_000_000.0
+    MAX_NOTIONAL = 1_000_000.0
+
+    def preview(self, action: str, ticker: str, quantity: int = 1, price: float = 0.0) -> dict:
+        if action not in self.allowed:
+            raise ValueError("Action is not allowlisted")
+        if not isinstance(ticker, str) or not ticker.strip():
+            raise ValueError("A ticker or company reference is required")
+        if type(quantity) is not int or not 1 <= quantity <= self.MAX_QUANTITY:
+            raise ValueError(f"Quantity must be an integer between 1 and {self.MAX_QUANTITY:,}")
+        if price:
+            if type(price) not in (int, float) or not 0 < price <= self.MAX_PRICE:
+                raise ValueError(f"Price must be between 0 and {self.MAX_PRICE:,.0f}")
+        notional = quantity * price
+        if notional > self.MAX_NOTIONAL:
+            raise ValueError("Sandbox notional limit exceeded")
+        reversibility, blast_radius = self.allowed[action]
+        return {
+            "action": action,
+            "ticker": ticker.upper(),
+            "quantity": quantity,
+            "notional": notional,
+            "reversibility": reversibility,
+            "blast_radius": blast_radius,
+            "dry_run": True,
+            "human_required": True,
+            "executed": False,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Deterministic action-request detector, feeding L8's ActionWhitelistGate.
+#
+# Kept rule-based rather than routed through intent_router's LLM call, for
+# the same reason blank/gibberish/injection classification is rule-based
+# (see node_logic.py's input_guard docstring and architecture.md Section
+# 5): whether a message is "research a company" vs. "take an action on my
+# behalf" is a security-relevant routing decision, not a nuance that needs
+# language understanding, so it should be 100% reproducible.
+# ---------------------------------------------------------------------------
+_ACTION_PATTERNS = [
+    ("add_to_watchlist", re.compile(r"add\s+([A-Za-z0-9 .&'-]{1,40}?)\s+to\s+(?:my\s+)?watchlist", re.I)),
+    ("remove_from_watchlist", re.compile(r"remove\s+([A-Za-z0-9 .&'-]{1,40}?)\s+from\s+(?:my\s+)?watchlist", re.I)),
+    ("set_price_alert", re.compile(r"set\s+(?:a\s+)?price\s+alert\s+for\s+([A-Za-z0-9 .&'-]{1,40}?)(?:\s+at\s+\$?([\d,]+(?:\.\d+)?))?\s*$", re.I)),
+    ("schedule_portfolio_review", re.compile(r"schedule\s+(?:a\s+)?portfolio\s+review", re.I)),
+    ("generate_trade_order_preview", re.compile(r"(?:place|preview)\s+a?\s*(?:trade|buy|sell|market|limit)\s*order\s+for\s+([A-Za-z0-9 .&'-]{1,40}?)(?:\s+(?:qty|quantity|x)\s*(\d+))?(?:\s+at\s+\$?([\d,]+(?:\.\d+)?))?\s*$", re.I)),
+]
+
+
+def detect_action_request(text: str) -> Optional[dict]:
+    """Returns {'action', 'reference', 'quantity', 'price'} when the
+    message is a request to DO something (take an action) rather than a
+    research question, else None. `reference` is whatever company name or
+    ticker-like token the user gave; node_logic.py resolves it against
+    the known-company lookup the same way a research question's company
+    reference is resolved.
+    """
+    text = normalize(text or "")
+    for action, pattern in _ACTION_PATTERNS:
+        match = pattern.search(text)
+        if not match:
+            continue
+        groups = match.groups()
+        reference = groups[0].strip() if groups and groups[0] else None
+        quantity = None
+        price = None
+        if action == "generate_trade_order_preview":
+            reference = groups[0].strip() if groups[0] else None
+            quantity = int(groups[1]) if len(groups) > 1 and groups[1] else 1
+            price = float(groups[2].replace(",", "")) if len(groups) > 2 and groups[2] else 0.0
+        elif action == "set_price_alert":
+            price = float(groups[1].replace(",", "")) if len(groups) > 1 and groups[1] else None
+        if action == "schedule_portfolio_review":
+            reference = reference or "portfolio"
+        return {"action": action, "reference": reference, "quantity": quantity or 1, "price": price or 0.0}
+    return None
+
+
+# ---------------------------------------------------------------------------
+# L7 — Bias / fairness screening (standalone utility, not wired into the
+# main research pipeline — see module docstring)
+# ---------------------------------------------------------------------------
+def fairness_audit(rows: list[dict]) -> dict:
+    """Selection-rate / disparate-impact screening over arbitrary
+    group/selected rows — e.g. "was company X recommended/flagged at a
+    different rate across sectors or market-cap bands than company Y."
+    Identical logic to SafeBank's version: this is a screening metric,
+    not proof of fairness or bias, and the 80% rule is a commonly used
+    rule of thumb, not a legal determination.
+    """
+    groups: dict[str, tuple[int, int]] = {}
+    for row in rows:
+        if type(row.get("selected")) is not bool or not isinstance(row.get("group"), str):
+            raise ValueError("Each row requires group:string and selected:boolean")
+        selected, count = groups.get(row["group"], (0, 0))
+        groups[row["group"]] = (selected + row["selected"], count + 1)
+    rates = {g: s / n for g, (s, n) in groups.items()}
+    highest = max(rates.values(), default=0)
+    ratio = min(rates.values()) / highest if highest and len(rates) > 1 else None
+    return {
+        "selection_rates": rates,
+        "sample_counts": {g: n for g, (_, n) in groups.items()},
+        "disparate_impact_ratio": ratio,
+        "review_flag": ratio is not None and ratio < 0.8,
+        "caution": "Screening metric only; small samples, base rates and context require expert review. Not proof of fairness or discrimination.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Convenience bundle so node_logic.py / graph_sim.py / the API layer each
+# pass ONE object around instead of four. `default()` is a lazy,
+# process-wide singleton: the Store (and therefore its on-disk SQLite
+# file/signing key) is only created the first time a turn actually runs
+# through the safety layer, never on import — so importing node_logic.py
+# for an unrelated unit test never touches disk.
+# ---------------------------------------------------------------------------
+class SafetyRuntime:
+    def __init__(self, store: Optional[Store] = None):
+        self.gate = SafetyGate()
+        self.masker = PIIMasker()
+        self.detector = PromptInjectionDetector()
+        self.store = store or Store()
+        self.action_gate = ActionWhitelistGate()
+
+    _default_instance: "Optional[SafetyRuntime]" = None
+
+    @classmethod
+    def default(cls) -> "SafetyRuntime":
+        if cls._default_instance is None:
+            cls._default_instance = cls()
+        return cls._default_instance
+
+
+SAFETY_AUDIT_DB_PATH = os.environ.get("SAFETY_AUDIT_DB_PATH", "data/safety_audit.db")
+safety = SafetyRuntime(store=Store(SAFETY_AUDIT_DB_PATH))
+
+# =============================================================================
 # Structured-output schemas — identical to schemas.py.
 # =============================================================================
 """
@@ -1900,6 +2432,11 @@ class ResearchState(TypedDict):
     flags: List[str]
     brief: Optional[dict]
     response: Optional[str]
+    # -- guardrail-layer fields (see safety_layer.py) --
+    pii_audit: Dict[str, int]
+    action_request: Optional[dict]
+    action_preview: Optional[dict]
+    review_id: Optional[str]
 
 
 """
@@ -1928,8 +2465,18 @@ Reset at the start of every turn by `start_turn`:
 """
 
 import concurrent.futures
+from datetime import datetime, timezone
 from typing import Optional
 
+# Guardrail layer ported from the "Week 18 — Ethics, Safety & Governance in
+# Agentic AI" notebook (as hardened in the SafeBank AI capstone built from
+# that same notebook) -- see safety_layer.py's module docstring for the
+# full mapping of each control (L1 privacy tokenization, L2 consent/kill
+# switch/rate limit, L3 injection screening, L5 human review queue, L7
+# fairness audit, L8 action allowlist) onto this agent's pipeline. L4
+# (grounding/no fabrication) and L6 (structured output) already existed
+# in this project before this guardrail pass -- see refusal_node,
+# IntentResult and ResearchBrief.
 # Real-company market data, alongside the synthetic ABC/XYZ/DEF universe
 # above — see real_market_data.py's module docstring for why both exist
 # side by side rather than one replacing the other. `tools_node` below
@@ -1958,6 +2505,9 @@ def _resolve_any_ticker(name_or_ticker: Optional[str]) -> Optional[str]:
     if not name_or_ticker:
         return None
     return resolve_ticker_or_none(name_or_ticker) or resolve_real_ticker_or_none(name_or_ticker)
+
+
+_pii_masker = PIIMasker()  # pure regex, no I/O -- safe to construct at import time
 
 
 def _known_companies_for_prompt() -> dict:
@@ -1995,6 +2545,11 @@ TRANSIENT_DEFAULTS = {
     "flags": [],
     "brief": None,
     "response": None,
+    # -- guardrail-layer transient fields (see safety_layer.py) --
+    "pii_audit": {},          # PII *type* counts only, from this turn's masking -- never raw values
+    "action_request": None,  # set by input_guard when the message is an action request, not research
+    "action_preview": None,  # the ActionWhitelistGate.preview() result, if any
+    "review_id": None,       # a human-review queue id, if this turn's flags/action warranted one
 }
 
 
@@ -2012,10 +2567,23 @@ def start_turn(state: dict, user_input: str) -> dict:
     `session_entities` intact (that IS the session memory), and appends the
     new user message to history. This is the single point where per-turn
     state gets a clean slate — see module docstring.
+
+    L1 privacy tokenization (safety_layer.PIIMasker) happens HERE, before
+    anything else sees the raw text: `user_input`, and the copy appended to
+    `messages`, are both the MASKED text from this point on. This mirrors
+    SafeBank's chat UI, which also displays the masked text back in the
+    conversation rather than the raw original — the agent's downstream
+    logic (company/ticker resolution, the LLM calls) works identically on
+    masked text, since none of the PII patterns can match a company name
+    or ticker (see safety_layer.py's PIIMasker.patterns). Only a `pii_audit`
+    *type-count* summary is kept in state — never the real values, and
+    never persisted beyond this turn.
     """
+    masked_input, pii_map = _pii_masker.mask(user_input or "")
     state = {**state, **TRANSIENT_DEFAULTS}
-    state["user_input"] = user_input
-    state["messages"] = state["messages"] + [{"role": "user", "content": user_input}]
+    state["user_input"] = masked_input
+    state["pii_audit"] = _pii_masker.audit_summary(pii_map)
+    state["messages"] = state["messages"] + [{"role": "user", "content": masked_input}]
     return state
 
 
@@ -2049,21 +2617,37 @@ def input_guard(state: dict) -> dict:
         "tool_flags": [],
         "brief": None,
         "response": None,
+        "action_request": None,
+        "action_preview": None,
+        "review_id": None,
     }
 
     if is_blank(text):
         return {**reset, "input_classification": "blank", "flags": []}
 
     injection_hit = detect_injection(text)
-    if injection_hit:
+    # L3, layered: SafetyRuntime's broader, notebook-derived pattern set
+    # (system-role spoofing, encoding tricks, "don't flag this", persona
+    # override) runs in addition to the check above, which is this
+    # project's own, narrower pattern set. Either one blocks.
+    advanced_injection = SafetyRuntime.default().detector.analyse(text)
+    if injection_hit or advanced_injection["blocked"]:
+        evidence = injection_hit or ",".join(advanced_injection["signals"])
         return {
             **reset,
             "input_classification": "injection",
-            "flags": [f"injection_detected_in_input:{injection_hit!r}"],
+            "flags": [f"injection_detected_in_input:{evidence!r}"],
         }
 
     if looks_like_gibberish(text):
         return {**reset, "input_classification": "gibberish", "flags": []}
+
+    # L8 — deterministic action-request routing (see safety_layer.py's
+    # detect_action_request docstring for why this is rule-based, like
+    # blank/gibberish/injection, rather than an LLM judgment call).
+    action_request = detect_action_request(text)
+    if action_request:
+        return {**reset, "input_classification": "action_request", "action_request": action_request, "flags": []}
 
     return {**reset, "input_classification": "valid", "flags": []}
 
@@ -2073,6 +2657,7 @@ def route_after_input_guard(state: dict) -> str:
         "blank": "blank_node",
         "gibberish": "gibberish_node",
         "injection": "injection_node",
+        "action_request": "action_preview_node",
         "valid": "intent_router",
     }[state["input_classification"]]
 
@@ -2359,14 +2944,107 @@ def clarification_node(state: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Node: update_memory_node  (runs at the end of every path)
+# Node: action_preview_node  (L8 — action allowlist + reversibility /
+# blast-radius gate, see safety_layer.ActionWhitelistGate)
+#
+# Reached only via input_guard's deterministic `action_request`
+# classification (see safety_layer.detect_action_request). Every result
+# here is a dry run: `executed` is always False, and a human-review record
+# is ALWAYS created, regardless of how low-risk the action looks — exactly
+# like SafeBank's "every account-impacting workflow requires review
+# irrespective of confidence," which is deliberately stricter than the
+# notebook's own auto-action thresholds. There is no code path anywhere in
+# this project that turns a preview into a real order, watchlist change,
+# or alert — see architecture.md's guardrail section for why that's a
+# property of the architecture (no execution adapter exists), not just a
+# promise this function keeps.
 # ---------------------------------------------------------------------------
-def update_memory_node(state: dict) -> dict:
+def action_preview_node(state: dict, session_id: str = "default-session", safety: Optional[SafetyRuntime] = None) -> dict:
+    safety = safety or SafetyRuntime.default()
+    req = state["action_request"]
+    reference = req.get("reference")
+    ticker = _resolve_any_ticker(reference) if reference else None
+    display_ticker = ticker or (reference.upper() if reference else "PORTFOLIO")
+
+    try:
+        preview = safety.action_gate.preview(
+            req["action"], display_ticker, quantity=req.get("quantity", 1) or 1, price=req.get("price", 0.0) or 0.0
+        )
+    except ValueError as exc:
+        return {"response": f"I can't preview that action: {exc}", "action_preview": {"error": str(exc)}}
+
+    review_id = safety.store.enqueue(session_id, f"action_preview:{preview['action']}")
+    lines = [
+        f"Action preview — {preview['action'].replace('_', ' ')} for {preview['ticker']}",
+        f"Quantity: {preview['quantity']} | Notional: ${preview['notional']:,.2f} | "
+        f"Reversibility: {preview['reversibility']} | Blast radius: {preview['blast_radius']}",
+        "This is a DRY RUN only — no watchlist was changed, no alert was set, no order was placed, "
+        "and this sandbox has no code path that ever executes a real action.",
+        f"A human-review record was created ({review_id}); nothing proceeds without a human approving it.",
+    ]
+    return {"response": "\n".join(lines), "action_preview": preview, "review_id": review_id}
+
+
+# ---------------------------------------------------------------------------
+# Node: human_review_gate_node  (L5 — human-in-the-loop review queue)
+#
+# Runs after reconcile_node + synthesize_brief_node on the normal research
+# path (see graph_sim.run_turn). Unlike SafeBank (where the trigger is the
+# banking INTENT itself), this agent has no intent that is inherently
+# high-risk, so the trigger is the same flags the rest of the pipeline
+# already raises for other reasons — see safety_layer.flags_warrant_review.
+# A flagged turn still gets its normal answer; this only ADDS a queued
+# record for a human to double-check, it never withholds the response.
+# ---------------------------------------------------------------------------
+def human_review_gate_node(state: dict, session_id: str = "default-session", safety: Optional[SafetyRuntime] = None) -> dict:
+    flags = state.get("flags", [])
+    if not flags_warrant_review(flags):
+        return {}
+    safety = safety or SafetyRuntime.default()
+    reason = ",".join(f for f in flags if f.startswith(("tool_failure:", "conflicting_data:", "injection_detected", "injected_content_detected:")))
+    review_id = safety.store.enqueue(session_id, reason or "flagged")
+    response = (state.get("response") or "") + (
+        f"\n\nNote: a human-review record was created ({review_id}) because this turn involved a data "
+        "issue (see the flags above) — nothing in the answer above was withheld or changed because of it."
+    )
+    return {"response": response, "review_id": review_id}
+
+
+# ---------------------------------------------------------------------------
+# Node: update_memory_node  (runs at the end of every path)
+#
+# This version differs from node_logic.py's in two ways, both required by
+# the REAL LangGraph app rather than node_logic.py's dependency-free local
+# simulation: (1) it returns a single `AIMessage` and lets the
+# `add_messages` reducer append it — see architecture.md Section 4 —
+# rather than rebuilding the whole plain-dict list by hand; (2) it takes
+# `(state, config)`, LangGraph's documented two-argument node signature
+# <https://langchain-ai.github.io/langgraph/concepts/low_level/#nodes>,
+# and reads `session_id` from `config["configurable"]["thread_id"]` --
+# the SAME id already used to key session memory, so one id now also
+# owns this turn's audit record and any review-queue entry. (Unverified
+# LIVE in this sandbox, which cannot install langgraph -- see this
+# project's established pattern of disclosing what's verified against
+# docs/stable behavior vs. actually run, e.g. yahoo_finance_market_data.py.)
+# ---------------------------------------------------------------------------
+def update_memory_node(state: dict, config: dict) -> dict:
     new_entities = dict(state.get("session_entities", {"company": None, "focus": None}))
     if state["resolved_company"]:
         new_entities["company"] = state["resolved_company"]
     if state["resolved_focus"]:
         new_entities["focus"] = state["resolved_focus"]
+
+    session_id = config["configurable"]["thread_id"]
+    safety.store.append({
+        "time": datetime.now(timezone.utc).isoformat(),
+        "owner": safety.store.owner(session_id),
+        "input_classification": state.get("input_classification"),
+        "resolved_company": state.get("resolved_company"),
+        "pii_types": sorted((state.get("pii_audit") or {}).keys()),
+        "flags": state.get("flags", []),
+        "action": (state.get("action_request") or {}).get("action"),
+        "review_id": state.get("review_id"),
+    })
 
     # `add_messages` (declared on ResearchState.messages) appends this single
     # new message to the persisted history — no need to rebuild the list.
@@ -2390,6 +3068,19 @@ _builder.add_node("rag_node", lambda state: rag_node(state, retriever))
 _builder.add_node("tools_node", tools_node)
 _builder.add_node("reconcile_node", reconcile_node)
 _builder.add_node("synthesize_brief_node", lambda state: synthesize_brief_node(state, llm))
+# L8 / L5 — guardrail-layer nodes (see safety_layer.py and node_logic.py's
+# module docstring). Wired via a lambda, same pattern as intent_router/
+# rag_node/synthesize_brief_node above, to supply the module-level
+# `safety` runtime; `session_id` comes from `config["configurable"]
+# ["thread_id"]` — the SAME id MemorySaver already keys session memory
+# by, per LangGraph's documented (state, config) node signature
+# <https://langchain-ai.github.io/langgraph/concepts/low_level/#nodes>
+# (unverified LIVE in this sandbox — see update_memory_node's comment
+# above for why).
+_builder.add_node("action_preview_node", lambda state, config: action_preview_node(
+    state, config["configurable"]["thread_id"], safety))
+_builder.add_node("human_review_gate_node", lambda state, config: human_review_gate_node(
+    state, config["configurable"]["thread_id"], safety))
 _builder.add_node("update_memory_node", update_memory_node)
 
 _builder.add_edge(START, "input_guard")
@@ -2397,6 +3088,7 @@ _builder.add_conditional_edges("input_guard", route_after_input_guard, {
     "blank_node": "blank_node",
     "gibberish_node": "gibberish_node",
     "injection_node": "injection_node",
+    "action_preview_node": "action_preview_node",
     "intent_router": "intent_router",
 })
 _builder.add_conditional_edges("intent_router", route_after_intent, {
@@ -2410,9 +3102,13 @@ _builder.add_edge("fan_out", "tools_node")
 _builder.add_edge("rag_node", "reconcile_node")
 _builder.add_edge("tools_node", "reconcile_node")
 _builder.add_edge("reconcile_node", "synthesize_brief_node")
+# L5 — every research-path answer passes through the human-review gate
+# (a no-op unless this turn's flags warrant a review — see
+# safety_layer.flags_warrant_review) before memory/audit update.
+_builder.add_edge("synthesize_brief_node", "human_review_gate_node")
 
 for _terminal in ["blank_node", "gibberish_node", "injection_node", "refusal_node",
-                   "clarification_node", "synthesize_brief_node"]:
+                   "clarification_node", "action_preview_node", "human_review_gate_node"]:
     _builder.add_edge(_terminal, "update_memory_node")
 
 _builder.add_edge("update_memory_node", END)
@@ -2452,6 +3148,16 @@ class ChatRequest(BaseModel):
         ..., description="The research question. An empty string is valid input — the agent's own guardrail asks for a request rather than erroring.",
         json_schema_extra={"example": "Research ABC Technologies: revenue growth and profitability."},
     )
+    consent: bool = PydanticField(
+        default=True,
+        description="L2 guardrail — must be true to proceed (see safety_layer.SafetyGate). Defaults to true "
+                     "so existing clients (gradio_app.py, react-ui/) built before this guardrail layer keep "
+                     "working unchanged; a UI that surfaces its own consent checkbox (streamlit_app.py) sets it explicitly.",
+    )
+    stopped: bool = PydanticField(
+        default=False,
+        description="L2 guardrail — this session's kill switch. true blocks the turn before the graph runs at all.",
+    )
 
 
 class ChatResponse(BaseModel):
@@ -2459,6 +3165,9 @@ class ChatResponse(BaseModel):
     response: str
     latency_ms: float
     flags: List[str] = []
+    blocked: bool = False
+    review_id: Optional[str] = None
+    action_preview: Optional[dict] = None
 
 
 class HealthResponse(BaseModel):
@@ -2474,6 +3183,24 @@ class DebugStateResponse(BaseModel):
     flags: List[str] = []
     tool_results: Dict[str, Any] = {}
     retrieved_docs: List[dict] = []
+    pii_audit: Dict[str, int] = {}
+    action_preview: Optional[dict] = None
+    review_id: Optional[str] = None
+
+
+class ReviewItem(BaseModel):
+    id: str
+    reason: str
+    status: str
+    created: float
+
+
+class ReviewDecisionRequest(BaseModel):
+    outcome: str = PydanticField(..., description="SIMULATED_APPROVED or SIMULATED_REJECTED — see safety_layer.Store.review.")
+
+
+class AuditIntegrityResponse(BaseModel):
+    verified: bool
 
 
 SERVER_START_TIME = time.time()
@@ -2504,13 +3231,53 @@ def health_check():
 def chat(request: ChatRequest):
     """Main agent endpoint. Pass the same `session_id` across calls to get
     session memory (the graph's `session_entities` + message history are
-    keyed by this id via the LangGraph checkpointer's thread_id)."""
+    keyed by this id via the LangGraph checkpointer's thread_id).
+
+    L2 guardrail (safety_layer.SafetyGate) runs BEFORE the graph: a
+    blocked request (no consent, kill switch on, blank, oversized, or
+    rate-limited) never reaches the LangGraph app at all, and is still
+    audited — see safety.store.append below.
+    """
     logger.info("Incoming request", extra={"session_id": request.session_id, "message_length": len(request.message)})
     start_time = time.time()
+
+    block = safety.gate.check(request.message, request.session_id, request.consent, request.stopped)
+    if block is not None:
+        safety.store.append({
+            "time": datetime.now(timezone.utc).isoformat(),
+            "owner": safety.store.owner(request.session_id),
+            "input_classification": f"blocked:{block['reason']}",
+            "flags": [f"safety_gate_blocked:{block['reason']}"],
+        })
+        return ChatResponse(
+            session_id=request.session_id,
+            response=block["message"],
+            latency_ms=round((time.time() - start_time) * 1000, 2),
+            flags=[f"safety_gate_blocked:{block['reason']}"],
+            blocked=True,
+        )
+
     try:
+        # L1 — privacy tokenization happens HERE, at the API's entry point,
+        # rather than inside a graph node: `research_graph.invoke`'s
+        # initial state (including the HumanMessage the `add_messages`
+        # reducer will persist into session memory) is built from the
+        # MASKED text, so no raw PII ever enters the graph, an LLM call,
+        # or the checkpointer's stored history. node_logic.py's own
+        # `start_turn` does the equivalent masking for the dependency-free
+        # local simulation (graph_sim.run_turn) — see that function's
+        # docstring; this is the same control, applied at the real API's
+        # actual entry point instead, since the real LangGraph app never
+        # calls `start_turn` (LangGraph builds its initial state directly
+        # from this endpoint's `.invoke()` call, not from that helper).
+        masked_message, _pii_map = safety.masker.mask(request.message)
         config = {"configurable": {"thread_id": request.session_id}}
         result = research_graph.invoke(
-            {"messages": [HumanMessage(content=request.message)], "user_input": request.message},
+            {
+                "messages": [HumanMessage(content=masked_message)],
+                "user_input": masked_message,
+                "pii_audit": safety.masker.audit_summary(_pii_map),
+            },
             config=config,
         )
         latency_ms = round((time.time() - start_time) * 1000, 2)
@@ -2522,6 +3289,9 @@ def chat(request: ChatRequest):
             response=result["response"],
             latency_ms=latency_ms,
             flags=result.get("flags", []),
+            blocked=result.get("input_classification") == "injection",
+            review_id=result.get("review_id"),
+            action_preview=result.get("action_preview"),
         )
     except Exception as e:
         logger.error("Agent invocation failed", extra={"session_id": request.session_id, "error": str(e)})
@@ -2529,6 +3299,33 @@ def chat(request: ChatRequest):
             status_code=500,
             detail="Investment Research Assistant is temporarily unavailable. Please try again.",
         )
+
+
+@app.get("/review/{session_id}", response_model=List[ReviewItem], tags=["Operations"])
+def list_review_queue(session_id: str):
+    """L5 guardrail — this session's human-review queue (see
+    safety_layer.Store.queue). NOT authenticated, same caveat as
+    /debug/{session_id} above."""
+    return [ReviewItem(**item) for item in safety.store.queue(session_id)]
+
+
+@app.post("/review/{session_id}/{review_id}", tags=["Operations"])
+def decide_review(session_id: str, review_id: str, request: ReviewDecisionRequest):
+    """Records a SIMULATED review outcome only — see
+    safety_layer.Store.review. Never changes a watchlist, alert, or
+    order; this sandbox has no code path that executes anything."""
+    try:
+        safety.store.review(session_id, review_id, request.outcome)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"status": "ok"}
+
+
+@app.get("/audit/verify", response_model=AuditIntegrityResponse, tags=["Operations"])
+def audit_verify():
+    """L_audit — verifies the HMAC-chained audit log hasn't been edited
+    since it was written (see safety_layer.Store.verify)."""
+    return AuditIntegrityResponse(verified=safety.store.verify())
 
 
 @app.get("/debug/{session_id}", response_model=DebugStateResponse, tags=["Operations"])
@@ -2548,4 +3345,7 @@ def debug_state(session_id: str):
         flags=snapshot.get("flags", []),
         tool_results=snapshot.get("tool_results", {}),
         retrieved_docs=snapshot.get("retrieved_docs", []),
+        pii_audit=snapshot.get("pii_audit", {}),
+        action_preview=snapshot.get("action_preview"),
+        review_id=snapshot.get("review_id"),
     )

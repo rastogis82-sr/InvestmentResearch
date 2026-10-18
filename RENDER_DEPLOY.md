@@ -161,3 +161,18 @@ print("Response:", result.json())
 - **`/debug/{session_id}` has no authentication** — same note as in
   `architecture.md`'s Deployment section. Acceptable for a demo URL only
   you and your grader know, not for a public production service.
+- **The guardrail layer's audit trail (`SAFETY_AUDIT_DB_PATH`) is also
+  ephemeral here** — it lives on the same free-tier local disk as
+  everything else, so it's wiped on every redeploy/restart, same
+  limitation as `MemorySaver` above. A production deployment wanting the
+  audit trail to survive restarts would point `SAFETY_AUDIT_DB_PATH` at a
+  Render persistent disk instead of the default relative path.
+- **Streamlit UI (`streamlit_app.py`) is not deployed as a Render service
+  here on purpose** — unlike the Gradio/React UIs, it runs the agent
+  in-process rather than calling the deployed API over HTTP, and it exists
+  to showcase the guardrail layer's internals for local/demo use (see
+  `architecture.md` Section 9g), not as a second public-facing frontend.
+  Run it locally with `pip install -r requirements-streamlit.txt &&
+  streamlit run streamlit_app.py` if you want it; nothing stops you from
+  deploying it the same way as `gradio_app.py` (9d) if you'd rather have it
+  public too — it just wasn't scoped in as a fifth deployed service here.

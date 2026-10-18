@@ -12,7 +12,7 @@ Produces: investment_research_api.py (validated with ast.parse)
 import ast
 import re
 
-LOCAL_MODULES = ["guardrails", "schemas", "tools_mock", "corpus", "node_logic", "mock_llm", "local_retriever", "real_market_data", "yahoo_finance_market_data", "merged_market_data"]
+LOCAL_MODULES = ["guardrails", "schemas", "tools_mock", "corpus", "node_logic", "mock_llm", "local_retriever", "real_market_data", "yahoo_finance_market_data", "merged_market_data", "safety_layer"]
 
 
 def load_and_clean(path: str) -> str:
@@ -46,7 +46,7 @@ node_logic_src = load_and_clean("node_logic.py").replace(
 # `add_messages` reducer append it — see architecture.md Section 4 — rather
 # than reconstructing the whole list by hand, which is what a reducer is for.
 # ---------------------------------------------------------------------------
-def update_memory_node(state: dict) -> dict:
+def update_memory_node(state: dict, session_id: str = "default-session", safety: Optional[SafetyRuntime] = None) -> dict:
     new_entities = dict(state.get("session_entities", {"company": None, "focus": None}))
     if state["resolved_company"]:
         new_entities["company"] = state["resolved_company"]
@@ -54,16 +54,61 @@ def update_memory_node(state: dict) -> dict:
         new_entities["focus"] = state["resolved_focus"]
 
     messages = state["messages"] + [{"role": "assistant", "content": state["response"]}]
+
+    # L_audit — one HMAC-chained, metadata-only record per turn (see
+    # safety_layer.Store). Never the raw question/answer text or a PII
+    # value: only classification, flags, PII *type* counts, and any
+    # review id. Runs on EVERY path (this node is the universal sink —
+    # see this function's position in graph_sim.run_turn), so a
+    # blank/gibberish/injection/action-request turn is audited exactly
+    # like a normal research turn.
+    safety = safety or SafetyRuntime.default()
+    safety.store.append({
+        "time": datetime.now(timezone.utc).isoformat(),
+        "owner": safety.store.owner(session_id),
+        "input_classification": state.get("input_classification"),
+        "resolved_company": state.get("resolved_company"),
+        "pii_types": sorted((state.get("pii_audit") or {}).keys()),
+        "flags": state.get("flags", []),
+        "action": (state.get("action_request") or {}).get("action"),
+        "review_id": state.get("review_id"),
+    })
     return {"session_entities": new_entities, "messages": messages}''',
     '''# ---------------------------------------------------------------------------
 # Node: update_memory_node  (runs at the end of every path)
+#
+# This version differs from node_logic.py's in two ways, both required by
+# the REAL LangGraph app rather than node_logic.py's dependency-free local
+# simulation: (1) it returns a single `AIMessage` and lets the
+# `add_messages` reducer append it — see architecture.md Section 4 —
+# rather than rebuilding the whole plain-dict list by hand; (2) it takes
+# `(state, config)`, LangGraph's documented two-argument node signature
+# <https://langchain-ai.github.io/langgraph/concepts/low_level/#nodes>,
+# and reads `session_id` from `config["configurable"]["thread_id"]` --
+# the SAME id already used to key session memory, so one id now also
+# owns this turn's audit record and any review-queue entry. (Unverified
+# LIVE in this sandbox, which cannot install langgraph -- see this
+# project's established pattern of disclosing what's verified against
+# docs/stable behavior vs. actually run, e.g. yahoo_finance_market_data.py.)
 # ---------------------------------------------------------------------------
-def update_memory_node(state: dict) -> dict:
+def update_memory_node(state: dict, config: dict) -> dict:
     new_entities = dict(state.get("session_entities", {"company": None, "focus": None}))
     if state["resolved_company"]:
         new_entities["company"] = state["resolved_company"]
     if state["resolved_focus"]:
         new_entities["focus"] = state["resolved_focus"]
+
+    session_id = config["configurable"]["thread_id"]
+    safety.store.append({
+        "time": datetime.now(timezone.utc).isoformat(),
+        "owner": safety.store.owner(session_id),
+        "input_classification": state.get("input_classification"),
+        "resolved_company": state.get("resolved_company"),
+        "pii_types": sorted((state.get("pii_audit") or {}).keys()),
+        "flags": state.get("flags", []),
+        "action": (state.get("action_request") or {}).get("action"),
+        "review_id": state.get("review_id"),
+    })
 
     # `add_messages` (declared on ResearchState.messages) appends this single
     # new message to the persisted history — no need to rebuild the list.
@@ -117,6 +162,11 @@ Configuration (environment variables, all optional with sane defaults):
     company profile and real financial-statement data that Twelve Data's
     free plan can't provide at all, independent of whether
     TWELVEDATA_API_KEY is set; ABC/XYZ/DEF are unaffected either way.)
+    SAFETY_AUDIT_DB_PATH Optional, default "data/safety_audit.db". The
+                        guardrail layer's tamper-evident audit log +
+                        human-review queue (see safety_layer.py) -- a
+                        local SQLite file; never raw question/answer
+                        text or a PII value, only metadata.
 
 All of the above are read from the process environment — never
 hardcoded in this file. Locally (or in Vocareum), copy `.env.example` to
@@ -221,6 +271,18 @@ logger = get_logger("investment_research_assistant")
 # gibberish-heuristic checks; see architecture.md Section 7).
 # =============================================================================
 {load_and_clean("guardrails.py")}
+
+# =============================================================================
+# Guardrail layer ported from the Week 18 Ethics/Safety/Governance notebook
+# (as hardened in the SafeBank AI capstone) — identical to safety_layer.py.
+# node_logic.py below imports from this module, so it must be defined
+# first. See safety_layer.py's module docstring and architecture.md's
+# guardrail section for the full mapping onto this agent's pipeline.
+# =============================================================================
+{load_and_clean("safety_layer.py")}
+
+SAFETY_AUDIT_DB_PATH = os.environ.get("SAFETY_AUDIT_DB_PATH", "data/safety_audit.db")
+safety = SafetyRuntime(store=Store(SAFETY_AUDIT_DB_PATH))
 
 # =============================================================================
 # Structured-output schemas — identical to schemas.py.
@@ -422,6 +484,11 @@ class ResearchState(TypedDict):
     flags: List[str]
     brief: Optional[dict]
     response: Optional[str]
+    # -- guardrail-layer fields (see safety_layer.py) --
+    pii_audit: Dict[str, int]
+    action_request: Optional[dict]
+    action_preview: Optional[dict]
+    review_id: Optional[str]
 
 
 {node_logic_src}
@@ -443,6 +510,19 @@ _builder.add_node("rag_node", lambda state: rag_node(state, retriever))
 _builder.add_node("tools_node", tools_node)
 _builder.add_node("reconcile_node", reconcile_node)
 _builder.add_node("synthesize_brief_node", lambda state: synthesize_brief_node(state, llm))
+# L8 / L5 — guardrail-layer nodes (see safety_layer.py and node_logic.py's
+# module docstring). Wired via a lambda, same pattern as intent_router/
+# rag_node/synthesize_brief_node above, to supply the module-level
+# `safety` runtime; `session_id` comes from `config["configurable"]
+# ["thread_id"]` — the SAME id MemorySaver already keys session memory
+# by, per LangGraph's documented (state, config) node signature
+# <https://langchain-ai.github.io/langgraph/concepts/low_level/#nodes>
+# (unverified LIVE in this sandbox — see update_memory_node's comment
+# above for why).
+_builder.add_node("action_preview_node", lambda state, config: action_preview_node(
+    state, config["configurable"]["thread_id"], safety))
+_builder.add_node("human_review_gate_node", lambda state, config: human_review_gate_node(
+    state, config["configurable"]["thread_id"], safety))
 _builder.add_node("update_memory_node", update_memory_node)
 
 _builder.add_edge(START, "input_guard")
@@ -450,6 +530,7 @@ _builder.add_conditional_edges("input_guard", route_after_input_guard, {{
     "blank_node": "blank_node",
     "gibberish_node": "gibberish_node",
     "injection_node": "injection_node",
+    "action_preview_node": "action_preview_node",
     "intent_router": "intent_router",
 }})
 _builder.add_conditional_edges("intent_router", route_after_intent, {{
@@ -463,9 +544,13 @@ _builder.add_edge("fan_out", "tools_node")
 _builder.add_edge("rag_node", "reconcile_node")
 _builder.add_edge("tools_node", "reconcile_node")
 _builder.add_edge("reconcile_node", "synthesize_brief_node")
+# L5 — every research-path answer passes through the human-review gate
+# (a no-op unless this turn's flags warrant a review — see
+# safety_layer.flags_warrant_review) before memory/audit update.
+_builder.add_edge("synthesize_brief_node", "human_review_gate_node")
 
 for _terminal in ["blank_node", "gibberish_node", "injection_node", "refusal_node",
-                   "clarification_node", "synthesize_brief_node"]:
+                   "clarification_node", "action_preview_node", "human_review_gate_node"]:
     _builder.add_edge(_terminal, "update_memory_node")
 
 _builder.add_edge("update_memory_node", END)
@@ -505,6 +590,16 @@ class ChatRequest(BaseModel):
         ..., description="The research question. An empty string is valid input — the agent's own guardrail asks for a request rather than erroring.",
         json_schema_extra={{"example": "Research ABC Technologies: revenue growth and profitability."}},
     )
+    consent: bool = PydanticField(
+        default=True,
+        description="L2 guardrail — must be true to proceed (see safety_layer.SafetyGate). Defaults to true "
+                     "so existing clients (gradio_app.py, react-ui/) built before this guardrail layer keep "
+                     "working unchanged; a UI that surfaces its own consent checkbox (streamlit_app.py) sets it explicitly.",
+    )
+    stopped: bool = PydanticField(
+        default=False,
+        description="L2 guardrail — this session's kill switch. true blocks the turn before the graph runs at all.",
+    )
 
 
 class ChatResponse(BaseModel):
@@ -512,6 +607,9 @@ class ChatResponse(BaseModel):
     response: str
     latency_ms: float
     flags: List[str] = []
+    blocked: bool = False
+    review_id: Optional[str] = None
+    action_preview: Optional[dict] = None
 
 
 class HealthResponse(BaseModel):
@@ -527,6 +625,24 @@ class DebugStateResponse(BaseModel):
     flags: List[str] = []
     tool_results: Dict[str, Any] = {{}}
     retrieved_docs: List[dict] = []
+    pii_audit: Dict[str, int] = {{}}
+    action_preview: Optional[dict] = None
+    review_id: Optional[str] = None
+
+
+class ReviewItem(BaseModel):
+    id: str
+    reason: str
+    status: str
+    created: float
+
+
+class ReviewDecisionRequest(BaseModel):
+    outcome: str = PydanticField(..., description="SIMULATED_APPROVED or SIMULATED_REJECTED — see safety_layer.Store.review.")
+
+
+class AuditIntegrityResponse(BaseModel):
+    verified: bool
 
 
 SERVER_START_TIME = time.time()
@@ -557,13 +673,53 @@ def health_check():
 def chat(request: ChatRequest):
     """Main agent endpoint. Pass the same `session_id` across calls to get
     session memory (the graph's `session_entities` + message history are
-    keyed by this id via the LangGraph checkpointer's thread_id)."""
+    keyed by this id via the LangGraph checkpointer's thread_id).
+
+    L2 guardrail (safety_layer.SafetyGate) runs BEFORE the graph: a
+    blocked request (no consent, kill switch on, blank, oversized, or
+    rate-limited) never reaches the LangGraph app at all, and is still
+    audited — see safety.store.append below.
+    """
     logger.info("Incoming request", extra={{"session_id": request.session_id, "message_length": len(request.message)}})
     start_time = time.time()
+
+    block = safety.gate.check(request.message, request.session_id, request.consent, request.stopped)
+    if block is not None:
+        safety.store.append({{
+            "time": datetime.now(timezone.utc).isoformat(),
+            "owner": safety.store.owner(request.session_id),
+            "input_classification": f"blocked:{{block['reason']}}",
+            "flags": [f"safety_gate_blocked:{{block['reason']}}"],
+        }})
+        return ChatResponse(
+            session_id=request.session_id,
+            response=block["message"],
+            latency_ms=round((time.time() - start_time) * 1000, 2),
+            flags=[f"safety_gate_blocked:{{block['reason']}}"],
+            blocked=True,
+        )
+
     try:
+        # L1 — privacy tokenization happens HERE, at the API's entry point,
+        # rather than inside a graph node: `research_graph.invoke`'s
+        # initial state (including the HumanMessage the `add_messages`
+        # reducer will persist into session memory) is built from the
+        # MASKED text, so no raw PII ever enters the graph, an LLM call,
+        # or the checkpointer's stored history. node_logic.py's own
+        # `start_turn` does the equivalent masking for the dependency-free
+        # local simulation (graph_sim.run_turn) — see that function's
+        # docstring; this is the same control, applied at the real API's
+        # actual entry point instead, since the real LangGraph app never
+        # calls `start_turn` (LangGraph builds its initial state directly
+        # from this endpoint's `.invoke()` call, not from that helper).
+        masked_message, _pii_map = safety.masker.mask(request.message)
         config = {{"configurable": {{"thread_id": request.session_id}}}}
         result = research_graph.invoke(
-            {{"messages": [HumanMessage(content=request.message)], "user_input": request.message}},
+            {{
+                "messages": [HumanMessage(content=masked_message)],
+                "user_input": masked_message,
+                "pii_audit": safety.masker.audit_summary(_pii_map),
+            }},
             config=config,
         )
         latency_ms = round((time.time() - start_time) * 1000, 2)
@@ -575,6 +731,9 @@ def chat(request: ChatRequest):
             response=result["response"],
             latency_ms=latency_ms,
             flags=result.get("flags", []),
+            blocked=result.get("input_classification") == "injection",
+            review_id=result.get("review_id"),
+            action_preview=result.get("action_preview"),
         )
     except Exception as e:
         logger.error("Agent invocation failed", extra={{"session_id": request.session_id, "error": str(e)}})
@@ -582,6 +741,33 @@ def chat(request: ChatRequest):
             status_code=500,
             detail="Investment Research Assistant is temporarily unavailable. Please try again.",
         )
+
+
+@app.get("/review/{{session_id}}", response_model=List[ReviewItem], tags=["Operations"])
+def list_review_queue(session_id: str):
+    """L5 guardrail — this session's human-review queue (see
+    safety_layer.Store.queue). NOT authenticated, same caveat as
+    /debug/{{session_id}} above."""
+    return [ReviewItem(**item) for item in safety.store.queue(session_id)]
+
+
+@app.post("/review/{{session_id}}/{{review_id}}", tags=["Operations"])
+def decide_review(session_id: str, review_id: str, request: ReviewDecisionRequest):
+    """Records a SIMULATED review outcome only — see
+    safety_layer.Store.review. Never changes a watchlist, alert, or
+    order; this sandbox has no code path that executes anything."""
+    try:
+        safety.store.review(session_id, review_id, request.outcome)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {{"status": "ok"}}
+
+
+@app.get("/audit/verify", response_model=AuditIntegrityResponse, tags=["Operations"])
+def audit_verify():
+    """L_audit — verifies the HMAC-chained audit log hasn't been edited
+    since it was written (see safety_layer.Store.verify)."""
+    return AuditIntegrityResponse(verified=safety.store.verify())
 
 
 @app.get("/debug/{{session_id}}", response_model=DebugStateResponse, tags=["Operations"])
@@ -601,6 +787,9 @@ def debug_state(session_id: str):
         flags=snapshot.get("flags", []),
         tool_results=snapshot.get("tool_results", {{}}),
         retrieved_docs=snapshot.get("retrieved_docs", []),
+        pii_audit=snapshot.get("pii_audit", {{}}),
+        action_preview=snapshot.get("action_preview"),
+        review_id=snapshot.get("review_id"),
     )
 '''
 
@@ -608,7 +797,14 @@ with open("investment_research_api.py", "w") as f:
     f.write(APP_SOURCE)
 
 try:
+    # ast.parse() alone has a blind spot: it does NOT enforce that
+    # `from __future__ import ...` appears only at the top of the file
+    # (that rule lives in the bytecode compiler, not the parser) -- a real
+    # bug this project hit once a second module (safety_layer.py) got
+    # inlined mid-file. compile() with mode="exec" runs the same checks
+    # python itself runs on import, so it catches that class of error too.
     ast.parse(APP_SOURCE)
+    compile(APP_SOURCE, "investment_research_api.py", "exec")
     print("investment_research_api.py written and syntax-verified.")
     print(f"Lines: {len(APP_SOURCE.splitlines())}")
 except SyntaxError as e:

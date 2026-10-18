@@ -17,6 +17,8 @@ services:
         value: "30"
       - key: YAHOO_FINANCE_CACHE_TTL_SECONDS
         value: "30"
+      - key: SAFETY_AUDIT_DB_PATH
+        value: "data/safety_audit.db"  # guardrail layer's audit trail + review queue (see architecture.md Section 6b) — on Render's free tier this is ephemeral local disk, recreated empty on each deploy/restart, same as everything else not on a persistent disk
       # --- Secrets: sync: false means Render will prompt for these in the
       # dashboard and never store the value in this file or in git. Set
       # them once under the service's Environment tab after it's created. ---

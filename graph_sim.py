@@ -17,6 +17,8 @@ sequential loop below simply substitutes for that persistence by keeping
 `state` in a local Python variable across calls within one test.
 """
 
+from datetime import datetime, timezone
+
 from node_logic import (
     new_state,
     start_turn,
@@ -33,14 +35,49 @@ from node_logic import (
     injection_node,
     refusal_node,
     clarification_node,
+    action_preview_node,
+    human_review_gate_node,
     update_memory_node,
 )
+from safety_layer import SafetyRuntime
 
 
-def run_turn(state: dict, user_input: str, llm, retriever) -> dict:
+def run_turn(
+    state: dict,
+    user_input: str,
+    llm,
+    retriever,
+    session_id: str = "default-session",
+    consent: bool = True,
+    stopped: bool = False,
+    safety: SafetyRuntime = None,
+) -> dict:
     """Runs one full turn through the graph, returning the NEW state.
     Mirrors invoking the compiled LangGraph app with a given thread_id.
+
+    `session_id`/`consent`/`stopped`/`safety` are the guardrail-layer
+    additions (see safety_layer.py and node_logic.py's module docstring);
+    all four default to values that reproduce this function's EXACT prior
+    behaviour (consent granted, kill switch off, a shared lazily-created
+    default SafetyRuntime) so every pre-existing caller/test is unaffected.
+
+    L2 (consent / kill switch / rate limit / size bound) is the very first
+    check, BEFORE `start_turn` even resets state for this turn — exactly
+    like SafeBank's `SafeBank.run()`, a blocked turn never reaches the
+    graph at all, and is still audited (see the final `safety.store.append`
+    call below).
     """
+    safety = safety or SafetyRuntime.default()
+    block = safety.gate.check(user_input, session_id, consent, stopped)
+    if block is not None:
+        safety.store.append({
+            "time": datetime.now(timezone.utc).isoformat(),
+            "owner": safety.store.owner(session_id),
+            "input_classification": f"blocked:{block['reason']}",
+            "flags": [f"safety_gate_blocked:{block['reason']}"],
+        })
+        return {**state, "response": block["message"], "input_classification": f"blocked:{block['reason']}"}
+
     state = start_turn(state, user_input)
 
     state = {**state, **input_guard(state)}
@@ -52,6 +89,8 @@ def run_turn(state: dict, user_input: str, llm, retriever) -> dict:
         state = {**state, **gibberish_node(state)}
     elif dest == "injection_node":
         state = {**state, **injection_node(state)}
+    elif dest == "action_preview_node":
+        state = {**state, **action_preview_node(state, session_id, safety)}
     else:  # intent_router
         state = {**state, **intent_router(state, llm)}
         dest2 = route_after_intent(state)
@@ -74,6 +113,12 @@ def run_turn(state: dict, user_input: str, llm, retriever) -> dict:
             state = {**state, **tools_node(state)}
             state = {**state, **reconcile_node(state)}
             state = {**state, **synthesize_brief_node(state, llm)}
+            # L5 — human review queue, triggered by the SAME flags the
+            # pipeline already raises for other reasons (see
+            # safety_layer.flags_warrant_review). Only on the research
+            # path: action_preview_node above already unconditionally
+            # queues a review for every action request.
+            state = {**state, **human_review_gate_node(state, session_id, safety)}
 
-    state = {**state, **update_memory_node(state)}
+    state = {**state, **update_memory_node(state, session_id, safety)}
     return state

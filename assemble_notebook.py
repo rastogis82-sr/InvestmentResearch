@@ -23,7 +23,7 @@ import json
 import re
 import base64
 
-LOCAL_MODULES = ["guardrails", "schemas", "tools_mock", "corpus", "node_logic", "mock_llm", "local_retriever", "real_market_data", "yahoo_finance_market_data", "merged_market_data"]
+LOCAL_MODULES = ["guardrails", "schemas", "tools_mock", "corpus", "node_logic", "mock_llm", "local_retriever", "real_market_data", "yahoo_finance_market_data", "merged_market_data", "safety_layer"]
 
 
 def load_and_clean(path: str) -> str:
@@ -436,6 +436,41 @@ character-salad input, catching it before incurring an LLM call.'''))
 cells.append(code(load_and_clean("guardrails.py")))
 
 # =============================================================================
+# Cell 5b — Guardrail layer ported from the Week 18 notebook
+# =============================================================================
+cells.append(md('''## 2a. Guardrail layer — Ethics, Safety & Governance in Agentic AI
+
+The checks above (Cell 5 / `guardrails.py`) predate this section and keep
+running unchanged. This section ADDS the eight-layer guardrail stack from
+the **"Week 18 — Ethics, Safety & Governance in Agentic AI"** notebook, as
+hardened in the **SafeBank AI** capstone built from that same notebook (a
+separate BFSI assistant) — reimplemented here for THIS agent's domain
+rather than reused directly, since the specifics differ (research actions
+instead of banking actions; no banking policy text, since this agent
+already grounds itself in RAG + live tool data).
+
+| Layer | Control | Where it plugs in |
+|---|---|---|
+| L1 | Privacy tokenization (`PIIMasker`) | `chat()` below masks the message before it ever reaches the graph or an LLM call |
+| L2 | Consent / kill switch / rate limit / size bound (`SafetyGate`) | `chat()`, before the graph even runs |
+| L3 | Prompt-injection screening (`PromptInjectionDetector`) | `input_guard`, layered on top of Cell 5's existing detector |
+| L4 | Grounding / no fabrication | unchanged (`refusal_node`, `ResearchBrief`) |
+| L5 | Human-in-the-loop review (`Store`'s queue) | `action_preview_node` (always) and `human_review_gate_node` (when flags warrant it) |
+| L6 | Structured output | unchanged (`IntentResult`, `ResearchBrief`) |
+| L7 | Bias / fairness screening (`fairness_audit`) | standalone utility, demonstrated in Section 10a below |
+| L8 | Action allowlist + reversibility gate (`ActionWhitelistGate`) | `action_preview_node`, reached when a message is an action request ("add AAPL to my watchlist") rather than a research question |
+
+Every control fails closed: on any internal error, the safe behaviour is
+to block/refuse, never to silently proceed. See `safety_layer.py`'s module
+docstring for the full detail and `architecture.md`'s guardrail section
+for the honest limits of each control (what regexes miss, what the audit
+chain can and can't detect, etc.).'''))
+cells.append(code(load_and_clean("safety_layer.py")))
+cells.append(code('''SAFETY_AUDIT_DB_PATH = os.environ.get("SAFETY_AUDIT_DB_PATH", "data/safety_audit.db")
+safety = SafetyRuntime(store=Store(SAFETY_AUDIT_DB_PATH))
+print(f"Guardrail layer ready. Audit log: {SAFETY_AUDIT_DB_PATH}")'''))
+
+# =============================================================================
 # Cell 6 — Schemas
 # =============================================================================
 cells.append(md('''## 3. Structured-output schemas
@@ -627,10 +662,68 @@ class ResearchState(TypedDict):
     flags: List[str]
     brief: Optional[dict]
     response: Optional[str]
+    # -- guardrail-layer fields (see safety_layer.py / Section 2a) --
+    pii_audit: Dict[str, int]
+    action_request: Optional[dict]
+    action_preview: Optional[dict]
+    review_id: Optional[str]
 ''' + "\n\n" + load_and_clean("node_logic.py").replace(
-    '''    messages = state["messages"] + [{"role": "assistant", "content": state["response"]}]
+    '''def update_memory_node(state: dict, session_id: str = "default-session", safety: Optional[SafetyRuntime] = None) -> dict:
+    new_entities = dict(state.get("session_entities", {"company": None, "focus": None}))
+    if state["resolved_company"]:
+        new_entities["company"] = state["resolved_company"]
+    if state["resolved_focus"]:
+        new_entities["focus"] = state["resolved_focus"]
+
+    messages = state["messages"] + [{"role": "assistant", "content": state["response"]}]
+
+    # L_audit — one HMAC-chained, metadata-only record per turn (see
+    # safety_layer.Store). Never the raw question/answer text or a PII
+    # value: only classification, flags, PII *type* counts, and any
+    # review id. Runs on EVERY path (this node is the universal sink —
+    # see this function's position in graph_sim.run_turn), so a
+    # blank/gibberish/injection/action-request turn is audited exactly
+    # like a normal research turn.
+    safety = safety or SafetyRuntime.default()
+    safety.store.append({
+        "time": datetime.now(timezone.utc).isoformat(),
+        "owner": safety.store.owner(session_id),
+        "input_classification": state.get("input_classification"),
+        "resolved_company": state.get("resolved_company"),
+        "pii_types": sorted((state.get("pii_audit") or {}).keys()),
+        "flags": state.get("flags", []),
+        "action": (state.get("action_request") or {}).get("action"),
+        "review_id": state.get("review_id"),
+    })
     return {"session_entities": new_entities, "messages": messages}''',
-    '''    # `add_messages` (declared on ResearchState.messages) appends this single
+    '''def update_memory_node(state: dict, config: dict) -> dict:
+    # This version differs from node_logic.py's in two ways, both required
+    # by the REAL LangGraph app rather than node_logic.py's dependency-free
+    # local simulation: it returns a single `AIMessage` and lets the
+    # `add_messages` reducer append it, and it takes `(state, config)` --
+    # LangGraph's documented two-argument node signature -- reading
+    # `session_id` from `config["configurable"]["thread_id"]`, the SAME id
+    # already used to key session memory, so it also owns this turn's
+    # audit record and any review-queue entry.
+    new_entities = dict(state.get("session_entities", {"company": None, "focus": None}))
+    if state["resolved_company"]:
+        new_entities["company"] = state["resolved_company"]
+    if state["resolved_focus"]:
+        new_entities["focus"] = state["resolved_focus"]
+
+    session_id = config["configurable"]["thread_id"]
+    safety.store.append({
+        "time": datetime.now(timezone.utc).isoformat(),
+        "owner": safety.store.owner(session_id),
+        "input_classification": state.get("input_classification"),
+        "resolved_company": state.get("resolved_company"),
+        "pii_types": sorted((state.get("pii_audit") or {}).keys()),
+        "flags": state.get("flags", []),
+        "action": (state.get("action_request") or {}).get("action"),
+        "review_id": state.get("review_id"),
+    })
+
+    # `add_messages` (declared on ResearchState.messages) appends this single
     # new message to the persisted history — no need to rebuild the list by
     # hand, unlike the dependency-free local-dict simulation this was ported
     # from (node_logic.py / graph_sim.py), which has no reducer.
@@ -668,6 +761,13 @@ _builder.add_node("rag_node", lambda state: rag_node(state, retriever))
 _builder.add_node("tools_node", tools_node)
 _builder.add_node("reconcile_node", reconcile_node)
 _builder.add_node("synthesize_brief_node", lambda state: synthesize_brief_node(state, llm))
+# L8 / L5 guardrail nodes (Section 2a) -- session_id comes from
+# config["configurable"]["thread_id"], the same id MemorySaver already
+# keys session memory by.
+_builder.add_node("action_preview_node", lambda state, config: action_preview_node(
+    state, config["configurable"]["thread_id"], safety))
+_builder.add_node("human_review_gate_node", lambda state, config: human_review_gate_node(
+    state, config["configurable"]["thread_id"], safety))
 _builder.add_node("update_memory_node", update_memory_node)
 
 _builder.add_edge(START, "input_guard")
@@ -675,6 +775,7 @@ _builder.add_conditional_edges("input_guard", route_after_input_guard, {
     "blank_node": "blank_node",
     "gibberish_node": "gibberish_node",
     "injection_node": "injection_node",
+    "action_preview_node": "action_preview_node",
     "intent_router": "intent_router",
 })
 _builder.add_conditional_edges("intent_router", route_after_intent, {
@@ -688,9 +789,12 @@ _builder.add_edge("fan_out", "tools_node")
 _builder.add_edge("rag_node", "reconcile_node")
 _builder.add_edge("tools_node", "reconcile_node")
 _builder.add_edge("reconcile_node", "synthesize_brief_node")
+# L5 -- every research-path answer passes through the human-review gate
+# (a no-op unless this turn's flags warrant one) before memory/audit update.
+_builder.add_edge("synthesize_brief_node", "human_review_gate_node")
 
 for _terminal in ["blank_node", "gibberish_node", "injection_node", "refusal_node",
-                   "clarification_node", "synthesize_brief_node"]:
+                   "clarification_node", "action_preview_node", "human_review_gate_node"]:
     _builder.add_edge(_terminal, "update_memory_node")
 
 _builder.add_edge("update_memory_node", END)
@@ -701,12 +805,33 @@ print(f"Graph compiled with {len(app.get_graph().nodes)} nodes.")'''))
 # =============================================================================
 # Cell 12 — Chat helper
 # =============================================================================
-cells.append(md('''## 9. Chat helper functions'''))
-cells.append(code('''def chat(thread_id: str, user_text: str) -> dict:
+cells.append(md('''## 9. Chat helper functions
+
+`chat()` now runs the L2 guardrail (`SafetyGate` — consent / kill switch /
+rate limit / size bound) before the graph at all, and does L1 privacy
+tokenization (`PIIMasker`) at this entry point rather than inside a node:
+the masked text is what the graph, any LLM call, and the checkpointer's
+persisted message history ever see — see Section 2a.'''))
+cells.append(code('''def chat(thread_id: str, user_text: str, consent: bool = True, stopped: bool = False) -> dict:
     """Invokes the compiled graph for one turn of a given session."""
+    block = safety.gate.check(user_text, thread_id, consent, stopped)
+    if block is not None:
+        safety.store.append({
+            "time": datetime.now(timezone.utc).isoformat(),
+            "owner": safety.store.owner(thread_id),
+            "input_classification": f"blocked:{block['reason']}",
+            "flags": [f"safety_gate_blocked:{block['reason']}"],
+        })
+        return {"response": block["message"], "input_classification": f"blocked:{block['reason']}", "flags": []}
+
+    masked_text, _pii_map = safety.masker.mask(user_text)
     config = {"configurable": {"thread_id": thread_id}}
     return app.invoke(
-        {"messages": [HumanMessage(content=user_text)], "user_input": user_text},
+        {
+            "messages": [HumanMessage(content=masked_text)],
+            "user_input": masked_text,
+            "pii_audit": safety.masker.audit_summary(_pii_map),
+        },
         config=config,
     )
 
@@ -887,6 +1012,48 @@ _check("session_memory: comparison target captured", s11["compare_to"] == "XYZ")
 
 n_pass = sum(1 for _, st in _results if st == _PASS)
 print(f"\\n{'='*60}\\n{n_pass} passed, {len(_results)-n_pass} failed out of {len(_results)} checks\\n{'='*60}")''')
+
+# =============================================================================
+# Cell 13b — Guardrail layer demo
+# =============================================================================
+cells.append(md('''### 10a. Guardrail layer demo (L1, L5, L7, L8, audit)
+
+Exercises the controls added in Section 2a directly, the same hands-on
+pattern as every other use case in the source notebook: mask → inspect,
+request an action → see the dry-run preview and the queued review record,
+then approve/reject it, then verify the audit chain is still intact.'''))
+cells.append(code('''# L1 — privacy tokenization: mask, inspect the audit-safe summary, unmask
+_demo_masked, _demo_map = safety.masker.mask("Contact jane@example.com about ABC Technologies, PAN ABCDE1234F")
+print("masked:          ", _demo_masked)
+print("audit summary:   ", safety.masker.audit_summary(_demo_map))  # types/counts only, never values
+print("unmask roundtrip:", safety.masker.unmask(_demo_masked, _demo_map))
+
+# L8 — action request: routed to action_preview_node, always a dry run
+action_result = chat("guardrail-demo", "Add AAPL to my watchlist")
+print("\\naction response:\\n", action_result["response"])
+print("action_preview:", action_result.get("action_preview"))
+
+# L5 — the action above created a human-review record; list it, then
+# simulate a reviewer approving it (never executes anything either way)
+pending = safety.store.queue("guardrail-demo")
+print("\\npending reviews:", pending)
+if pending:
+    safety.store.review("guardrail-demo", pending[0]["id"], "SIMULATED_APPROVED")
+    print("after review:   ", safety.store.queue("guardrail-demo"))
+
+# L5, continued — a research turn whose flags warrant review gets queued too
+chat("guardrail-demo-2", "Research ABC Technologies sector risk.")  # trips the poisoned-doc flag, see test 10 above
+print("\\nflag-triggered reviews:", safety.store.queue("guardrail-demo-2"))
+
+# L7 — fairness screening (standalone; not wired into the main pipeline —
+# this agent makes no selection decision to audit automatically)
+print("\\nfairness audit:", fairness_audit([
+    {"group": "large_cap", "selected": True}, {"group": "large_cap", "selected": False},
+    {"group": "small_cap", "selected": False}, {"group": "small_cap", "selected": False},
+]))
+
+# L_audit — tamper-evident chain, still valid after everything above
+print("\\naudit chain verified:", safety.store.verify())'''))
 
 cells.append(md('''### 10b. Optional: live real-company query
 
@@ -1162,7 +1329,14 @@ print(json.dumps(call_api("api_demo_4", "Now compare its profitability with XYZ.
 
 print("\\n5) Debug endpoint (unauthenticated — see architecture.md limitations):")
 debug_resp = requests.get(f"{PUBLIC_URL}/debug/api_demo_4", headers=_HEADERS, timeout=30)
-print(json.dumps(debug_resp.json(), indent=2))'''))
+print(json.dumps(debug_resp.json(), indent=2))
+
+print("\\n6) Guardrail layer over HTTP -- action request, review queue, audit integrity:")
+print(json.dumps(call_api("api_demo_6", "Add AAPL to my watchlist"), indent=2))
+review_resp = requests.get(f"{PUBLIC_URL}/review/api_demo_6", headers=_HEADERS, timeout=30)
+print("review queue:", json.dumps(review_resp.json(), indent=2))
+audit_resp = requests.get(f"{PUBLIC_URL}/audit/verify", headers=_HEADERS, timeout=30)
+print("audit integrity:", json.dumps(audit_resp.json(), indent=2))'''))
 
 cells.append(md('''### 12.5 Shut down (optional cleanup)
 
@@ -1198,6 +1372,17 @@ cells.append(md('''## 13. Notes, limitations, and rubric mapping
 - `/debug/{session_id}` is intentionally **unauthenticated** — acceptable
   behind a private, short-lived ngrok URL for a classroom demo, not for a
   broader deployment.
+- **Guardrail layer (Section 2a)** limits, same as the source notebook /
+  SafeBank AI honestly document: regex-based PII masking misses unusual
+  formats and multilingual text; the HMAC audit chain detects edits but
+  not deletion of a whole trailing slice without an external checkpoint;
+  session identifiers are random, not authenticated identities, so a new
+  session resets the rate limit and bypasses the kill switch; fairness
+  screening is a standalone utility, not wired into an automatic decision
+  this agent doesn't make. This is a bounded classroom workflow agent
+  (classify → retrieve → validate → escalate → audit), not a
+  production-certified system — see `architecture.md`'s guardrail
+  section for the full writeup.
 
 See `architecture.md` for the full design rationale, the node-by-node
 walkthrough, the state design decisions (why `rag_flags`/`tool_flags` are
