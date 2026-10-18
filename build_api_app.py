@@ -545,7 +545,22 @@ _builder.add_node("action_preview_node", lambda state, config: action_preview_no
     state, config["configurable"]["thread_id"], safety))
 _builder.add_node("human_review_gate_node", lambda state, config: human_review_gate_node(
     state, config["configurable"]["thread_id"], safety))
-_builder.add_node("update_memory_node", update_memory_node)
+# update_memory_node is registered through a lambda too, NOT passed directly
+# like `_builder.add_node("update_memory_node", update_memory_node)` --
+# confirmed via a real production traceback (LangGraph 1.2.16) that passing
+# it directly raises `TypeError: update_memory_node() missing 1 required
+# positional argument: 'config'` on every invocation. Root cause: LangGraph
+# 1.x's add_node decides whether to inject `config` by inspecting the
+# second parameter's TYPE ANNOTATION, not just its arity -- a plain `def`
+# with `config: dict` (as this file types it, for readability) isn't
+# recognized as wanting RunnableConfig, so LangGraph calls it with only
+# `state`. The untyped lambdas above sidestep this entirely: LangGraph
+# falls back to counting positional parameters for an unannotated
+# callable, which correctly detects 2 and passes config -- same escape
+# hatch used here, rather than importing and annotating with the exact
+# RunnableConfig type LangGraph 1.x expects (unverified which import path/
+# shape that needs in this sandbox, which cannot install langgraph at all).
+_builder.add_node("update_memory_node", lambda state, config: update_memory_node(state, config))
 
 _builder.add_edge(START, "input_guard")
 _builder.add_conditional_edges("input_guard", route_after_input_guard, {{

@@ -538,10 +538,59 @@ diagnosable from Render's Logs tab instead of only a generic 500).
 Verified with a dedicated fault-injection test (patching `Store.append`/
 `Store.enqueue` to always raise) across all three affected paths —
 research turn, action-preview turn, and a consent-blocked turn — each
-still returns a real response. This does **not** explain why the Store
-write failed in the first place on Render specifically (not reproduced
-in this sandbox under concurrent load); if it recurs, the new
-`logger.warning`/traceback logging is what to check next.
+still returns a real response. This fail-open fix is good hardening, but
+it turned out **not** to be the actual root cause of the production 500
+— see below.
+
+**Production incident #2, confirmed root cause: LangGraph 1.x changed how
+`add_node` decides whether to inject `config`.** The fail-open fix above
+shipped, but the exact same request (even a fully synthetic one with no
+PII and no real-company tool call — "Research ABC Technologies: revenue
+growth and profitability.", which deterministically produces a
+`conflicting_data` flag by design) kept returning `HTTP 500`. The real
+traceback, pulled from Render's logs after the `exc_info=True`/
+`JSONFormatter` fix above made it actually readable, was:
+
+```
+TypeError: update_memory_node() missing 1 required positional argument: 'config'
+```
+
+Root cause: `requirements.txt` pins `langgraph>=0.2.0` with no upper
+bound (same unpinned-range pattern that previously broke
+`gradio_app.py` when Render resolved `gradio==6.29.1` instead of
+whatever 4.x this project was written against — see Section 9's
+Troubleshooting). Render resolved `langgraph==1.2.16`, a major-version
+jump from whatever this code was ever actually validated against. In
+that version, `add_node` decides whether to pass `config` into a node
+by inspecting the **type annotation** of its second parameter, not just
+its arity — confirmed by a `UserWarning` at graph-compile time pointing
+at this exact line: `"The 'config' parameter should be typed as
+'RunnableConfig' or 'RunnableConfig | None', not '<class 'dict'>'."`
+`update_memory_node` is a plain `def update_memory_node(state: dict,
+config: dict) -> dict`, typed as `config: dict` for readability — not
+recognized as wanting `RunnableConfig`, so LangGraph called it with only
+`state`, and the function (which has no default for `config`) raised.
+`action_preview_node` and `human_review_gate_node` were unaffected
+because they're registered as *untyped* lambdas
+(`lambda state, config: ...`), which LangGraph falls back to counting
+positional parameters for — no type hint to misread. **Fix:** register
+`update_memory_node` through the same kind of untyped lambda —
+`_builder.add_node("update_memory_node", lambda state, config:
+update_memory_node(state, config))` — rather than passing the typed
+function directly, in both `build_api_app.py` and `assemble_notebook.py`.
+This sandbox cannot install `langgraph` to verify the fix against the
+real package (confirmed by attempting `pip install langgraph` here,
+which fails with no network route to PyPI from this environment — a
+different restriction than the proxy-only egress this project's other
+"unverified live" disclosures refer to), so this fix is verified by
+direct traceback analysis against the real exception and by the full
+178-check local suite, not by re-running it against LangGraph 1.2.16
+locally. **Lesson for next time:** an unpinned `>=` floor on a
+fast-moving framework dependency is a standing risk in this project,
+demonstrated twice now (Gradio, then LangGraph) — the honest fix is to
+pin exact tested versions once a given deploy is confirmed working,
+the same way `requirements-gradio.txt` now pins `gradio==6.29.1` instead
+of a floor.
 
 ---
 

@@ -780,7 +780,18 @@ _builder.add_node("action_preview_node", lambda state, config: action_preview_no
     state, config["configurable"]["thread_id"], safety))
 _builder.add_node("human_review_gate_node", lambda state, config: human_review_gate_node(
     state, config["configurable"]["thread_id"], safety))
-_builder.add_node("update_memory_node", update_memory_node)
+# Registered through a lambda, NOT passed directly as
+# `_builder.add_node("update_memory_node", update_memory_node)` -- a real
+# production traceback (LangGraph 1.2.16) showed that raises `TypeError:
+# update_memory_node() missing 1 required positional argument: 'config'`
+# on every call. LangGraph 1.x's add_node decides whether to inject
+# `config` from the second parameter's TYPE ANNOTATION, not just its
+# arity; `config: dict` (typed that way here for readability) isn't
+# recognized as RunnableConfig, so it gets called with only `state`. The
+# untyped lambda sidesteps this -- LangGraph falls back to counting
+# positional parameters for an unannotated callable, same as the two
+# nodes above.
+_builder.add_node("update_memory_node", lambda state, config: update_memory_node(state, config))
 
 _builder.add_edge(START, "input_guard")
 _builder.add_conditional_edges("input_guard", route_after_input_guard, {
